@@ -1,0 +1,19 @@
+[package]
+name = "port_forwarding-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+port_forwarding-common = { path = "../port_forwarding-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+network-types = "0.1.0"
+
+[build-dependencies]
+# which = { workspace = true }
+which = "8.0.2"
+
+[[bin]]
+name = "port_forwarding"
+path = "src/main.rs"
