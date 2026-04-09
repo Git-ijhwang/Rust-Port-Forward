@@ -3,7 +3,7 @@
 
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::Ipv4Hdr,
+    ip::{self, Ipv4Hdr},
     tcp::TcpHdr,
 };
 
@@ -26,11 +26,8 @@ use port_forwarding_common::{
 
 use crate::verify::{PacketContext, ptr_at, verify_headers};
 use crate::cksum::{update_ip_checksum, update_tcp_checksum};
-
-// use crate::XdpContext;
-// use aya_ebpf::programs::XdpContext;
-
 mod verify;
+mod ether;
 mod cksum;
 
 #[map]
@@ -39,6 +36,7 @@ pub static INVERSE_MAP: LruHashMap<SessionKey, SessionValue> =
 
 #[map]
 static RULES: HashMap<u16, ForwardRule> = HashMap::with_max_entries(1024, 0);
+
 #[map]
 static IFACE_STATS: HashMap<u32, InterfaceState> = HashMap::with_max_entries(16, 0);
 
@@ -76,6 +74,49 @@ fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &Pa
     }
 
     Ok(())
+}
+
+fn try_restore_response(ctx: &XdpContext, packet: &PacketContext)
+    -> Result<u32, ()>
+{
+    let sess_key = SessionKey {
+        target_ip: unsafe { (*packet.ip_hdr).src_addr},
+        target_port: packet.sport,
+        ebpf_port: packet.dport,
+    };
+
+    // let sess_val = 
+    //     Some(v) => v,
+    //     None => return Err(()), 
+    // };
+
+    let sess_val: &SessionValue =match unsafe {INVERSE_MAP.get(&sess_key) } {
+        Some(v) => v,
+        None => return Err(()), 
+    };
+        // 원래 IP/Port로 복원
+
+    unsafe {
+        let ip_hdr =  &mut *(packet.ip_hdr as *mut Ipv4Hdr);
+        let tcp_hdr =  &mut *ptr_at::<TcpHdr>(&ctx, packet.l4_hdr_start)?;
+
+        let old_sip = ip_hdr.src_addr;
+        let old_dip = ip_hdr.dst_addr;
+        let old_sport = tcp_hdr.source;
+        let old_dport = tcp_hdr.dest;
+
+        ip_hdr.src_addr = [192, 168, 4, 146]; // 원래 서버 IP로 복원
+        ip_hdr.dst_addr = sess_val.orig_src_ip;
+
+        tcp_hdr.source = 80u16.to_be_bytes(); // 원래 서버 포트로 복원
+        // tcp_hdr.dest = sess_key.target_port.to_be_bytes();
+
+        // Checksum 업데이트
+        update_ip_checksum(ip_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr);
+        update_tcp_checksum(tcp_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr, old_sport, tcp_hdr.source);
+
+    }
+    Ok(xdp_action::XDP_TX)
 }
 
 
@@ -141,6 +182,12 @@ fn try_port_forwarding(ctx: XdpContext) -> Result<u32, ()> {
             // 수정된 패킷을 인터페이스로 바로 다시 내보냄
             return Ok(xdp_action::XDP_TX);
         }
+    }
+
+    if let Ok(ret) = try_restore_response(&ctx, &packet) {
+        info!(&ctx, "Faile to Restore response packet for session with target ");
+        return Ok(xdp_action::XDP_TX);
+
     }
 
     Ok(xdp_action::XDP_PASS)

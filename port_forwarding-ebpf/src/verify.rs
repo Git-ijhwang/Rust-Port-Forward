@@ -12,6 +12,7 @@ pub struct PacketContext {
     pub ip_hdr: *mut Ipv4Hdr,     // 수정을 위해 mut 포인터 사용
     pub proto: L4Protocol,
     pub dport: u16,               // 목적지 포트 (Host 엔디안)
+    pub sport: u16,               // 목적지 포트 (Host 엔디안)
     pub l4_hdr_start: usize,      // L4 헤더가 시작되는 위치(오프셋)
 }
 
@@ -69,6 +70,7 @@ pub unsafe fn verify_headers(ctx: &XdpContext)
                 proto: L4Protocol::Tcp,
                 // network-types 크레이트 버전에 따라 필드명이 다를 수 있으니 주의
                 dport: u16::from_be_bytes((*tcp).dest), 
+                sport: u16::from_be_bytes((*tcp).source), 
                 l4_hdr_start: l4_offset,
             })
         }
@@ -78,6 +80,7 @@ pub unsafe fn verify_headers(ctx: &XdpContext)
                 ip_hdr: ip,
                 proto: L4Protocol::Udp,
                 dport: u16::from_be_bytes((*udp).dst), // dst -> dest 일관성 확인
+                sport: u16::from_be_bytes((*udp).src), // src -> source 일관성 확인
                 l4_hdr_start: l4_offset,
             })
         }
