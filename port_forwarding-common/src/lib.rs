@@ -52,8 +52,8 @@ unsafe impl aya::Pod for SessionValue {}
 #[derive(Clone, Copy)]
 pub struct GlobalConfig {
     pub gw_mac: [u8; 6],      // Gateway(AP) MAC
+    pub my_mac: [u8; 6],      // ebpf MAC
     pub my_ip: [u8; 4],       // eBPF 기기 IP
-    pub service_port: u16,    // 서비스 포트 (예: 80)
 }
 
 #[cfg(feature = "user")]

@@ -10,7 +10,7 @@ use network_types::{
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{xdp, map},
-    maps::{LruHashMap, HashMap},
+    maps::{LruHashMap, Array, HashMap},
     programs::XdpContext
 };
 use aya_log_ebpf::info;
@@ -18,14 +18,12 @@ use aya_ebpf::helpers::r#gen::{bpf_csum_update, bpf_csum_diff};
 
 use core::{net::Ipv4Addr, num::Wrapping};
 use port_forwarding_common::{
-    ForwardRule,
-    InterfaceState,
-    SessionKey,
-    SessionValue
+    ForwardRule, GlobalConfig, InterfaceState, SessionKey, SessionValue
 };
 
 use crate::verify::{PacketContext, ptr_at, verify_headers};
 use crate::cksum::{update_ip_checksum, update_tcp_checksum};
+use crate::ether::update_eth_header;
 mod verify;
 mod ether;
 mod cksum;
@@ -40,6 +38,9 @@ static RULES: HashMap<u16, ForwardRule> = HashMap::with_max_entries(1024, 0);
 #[map]
 static IFACE_STATS: HashMap<u32, InterfaceState> = HashMap::with_max_entries(16, 0);
 
+#[map]
+pub static CONFIG: Array<GlobalConfig> = Array::with_max_entries(1, 0);
+
 #[xdp]
 pub fn port_forwarding(ctx: XdpContext) -> u32 {
     match try_port_forwarding(ctx) {
@@ -47,6 +48,7 @@ pub fn port_forwarding(ctx: XdpContext) -> u32 {
         Err(_) => xdp_action::XDP_ABORTED,
     }
 }
+
 
 #[inline(always)]
 fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &PacketContext)
@@ -77,7 +79,7 @@ fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &Pa
 }
 
 
-fn try_restore_response(ctx: &XdpContext, packet: &PacketContext)
+fn try_restore_response(ctx: &XdpContext, packet: &PacketContext, config: &GlobalConfig)
     -> Result<u32, ()>
 {
     let sess_key = SessionKey {
@@ -95,9 +97,10 @@ fn try_restore_response(ctx: &XdpContext, packet: &PacketContext)
         Some(v) => v,
         None => return Err(()), 
     };
-        // 원래 IP/Port로 복원
 
+    // 원래 IP/Port로 복원
     unsafe {
+        let eth_hdr = &mut *(ctx.data() as *mut EthHdr);
         let ip_hdr =  &mut *(packet.ip_hdr as *mut Ipv4Hdr);
         let tcp_hdr =  &mut *ptr_at::<TcpHdr>(&ctx, packet.l4_hdr_start)?;
 
@@ -115,6 +118,8 @@ fn try_restore_response(ctx: &XdpContext, packet: &PacketContext)
         // Checksum 업데이트
         update_ip_checksum(ip_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr);
         update_tcp_checksum(tcp_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr, old_sport, tcp_hdr.source);
+
+        update_eth_header(eth_hdr, config);
 
     }
     Ok(xdp_action::XDP_TX)
@@ -140,6 +145,9 @@ fn try_port_forwarding(ctx: XdpContext) -> Result<u32, ()> {
         Err(_) => return Ok(xdp_action::XDP_PASS),
     };
 
+    let config = unsafe { CONFIG.get(0).ok_or(())? };
+    let config = unsafe { &*config };
+
     if let Some(rule) =  RULES.get_ptr_mut(&packet.dport) {
         info!(&ctx, "Matched forwarding rule for port {}", packet.dport);
 
@@ -155,7 +163,7 @@ fn try_port_forwarding(ctx: XdpContext) -> Result<u32, ()> {
             let old_sip = ip_hdr.src_addr;
             let old_dip = ip_hdr.dst_addr;
 
-            let new_sip: [u8; 4] = [192, 168, 4, 146];
+            let new_sip: [u8; 4] = config.my_ip;
             let new_dip = (*rule).target_ip;
 
             //Update Ips
@@ -185,7 +193,7 @@ fn try_port_forwarding(ctx: XdpContext) -> Result<u32, ()> {
         }
     }
 
-    if let Ok(ret) = try_restore_response(&ctx, &packet) {
+    if let Ok(ret) = try_restore_response(&ctx, &packet, config) {
         info!(&ctx, "Faile to Restore response packet for session with target ");
         return Ok(xdp_action::XDP_TX);
 

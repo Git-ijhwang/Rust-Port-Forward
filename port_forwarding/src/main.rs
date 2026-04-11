@@ -17,7 +17,7 @@ use log::info;
 use dotenvy::dotenv;
 use std::env;
 use aya::maps::Array;
-use common::GlobalConfig;
+use port_forwarding_commoncommon::GlobalConfig;
 use std::net::Ipv4Addr;
 
 #[derive(Debug, Parser)]
