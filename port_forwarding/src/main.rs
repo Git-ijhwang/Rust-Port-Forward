@@ -14,10 +14,50 @@ use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::{HashMap};
 use log::info;
 
+use dotenvy::dotenv;
+use std::env;
+use aya::maps::Array;
+use common::GlobalConfig;
+use std::net::Ipv4Addr;
+
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "wlp3s0")]
     iface: String,
+}
+
+fn config_setup (ebpf: &mut Ebpf)
+    -> Result<(), anyhow::Error>
+{
+    dotenv().ok();
+
+    let parse_mac = |key: &str| -> [u8; 6] {
+        let mut res = [0u8; 6];
+        let s = env::var(key).expect("Missing env key");
+
+        for (i, b) in s.split(":").map(|b| u8::from_str_radix(b, 16).unwrap()).enumerate() {
+            res[i] = b;
+        }
+
+        println!("Parsed MAC for {}: {:02x?}", key, res);
+        res
+    };
+
+    let config = GlobalConfig {
+        gw_mac: parse_mac("GW_MAC"),
+        my_mac: parse_mac("MY_MAC"),
+        my_ip: env::var("MY_IP")?.parse::<Ipv4Addr>()?.octets(),
+    };
+
+    // Load the global config into the eBPF map
+    let mut config_map: Array<_, GlobalConfig> =
+        Array::try_from(ebpf.map_mut("GLOBAL_CONFIG")?)?;
+    
+    // We only have one config, so we use index 0
+    config_map.set(0, &config, 0)?;
+
+    println!("Global Config loaded into eBPF map");
+    Ok(())
 }
 
 #[tokio::main]
@@ -47,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
         // concat!( env!("OUT_DIR"), "/port_forwarding")
         "../../target/bpfel-unknown-none/release/port_forwarding"
     ))?;
+
+    config_setup(&mut ebpf)?;
 
     // match aya_log::EbpfLogger::init(&mut ebpf) {
     //     Err(e) => {

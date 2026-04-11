@@ -76,6 +76,7 @@ fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &Pa
     Ok(())
 }
 
+
 fn try_restore_response(ctx: &XdpContext, packet: &PacketContext)
     -> Result<u32, ()>
 {

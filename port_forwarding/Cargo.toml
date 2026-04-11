@@ -24,8 +24,9 @@ log = { workspace = true }
 tokio = { version = "1.50", features = ["full"] }
 bytes="1.11.1"
 nix = { version = "0.31.2", features = ["net"] }
-
 clap = { workspace = true, features = ["derive"] }
+dotenvy = "0.15.7"
+common = "0.1.0"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
