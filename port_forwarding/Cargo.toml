@@ -27,6 +27,7 @@ nix = { version = "0.31.2", features = ["net"] }
 clap = { workspace = true, features = ["derive"] }
 dotenvy = "0.15.7"
 common = "0.1.0"
+termion = "4.0.6"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

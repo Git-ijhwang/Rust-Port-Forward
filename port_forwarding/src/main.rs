@@ -13,12 +13,28 @@ use tokio::signal;
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::{HashMap};
 use log::info;
+use std::sync::mpsc;
 
 use dotenvy::dotenv;
 use std::env;
 use aya::maps::Array;
-use port_forwarding_commoncommon::GlobalConfig;
+use port_forwarding_common::GlobalConfig;
 use std::net::Ipv4Addr;
+use std::thread;
+
+mod cli;
+
+pub enum ControlMessage {
+    // 새로운 룰 추가: [IP 주소, 타겟 포트]
+    AddRule {
+        target_ip: [u8; 4],
+        target_port: u16,
+    },
+    // 특정 포트의 룰 삭제
+    DeleteRule {
+        target_port: u16,
+    },
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -51,13 +67,54 @@ fn config_setup (ebpf: &mut Ebpf)
 
     // Load the global config into the eBPF map
     let mut config_map: Array<_, GlobalConfig> =
-        Array::try_from(ebpf.map_mut("GLOBAL_CONFIG")?)?;
+        Array::try_from(ebpf.map_mut("GLOBAL_CONFIG")
+            .ok_or(anyhow::anyhow!("Failed to get GLOBAL_CONFIG map"))?)?;
     
     // We only have one config, so we use index 0
     config_map.set(0, &config, 0)?;
 
     println!("Global Config loaded into eBPF map");
     Ok(())
+}
+
+fn recv_message (mut ebpf: Ebpf, rx: mpsc::Receiver<ControlMessage>)
+    -> anyhow::Result<()>
+{
+    println!("Waiting for commands...");
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            //Add Rule
+            ControlMessage::AddRule { target_ip, target_port } => {
+                let mut rules: HashMap<_, u16, ForwardRule> = 
+                    HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
+                
+                let new_rule = ForwardRule {
+                    target_ip,
+                    target_port,
+                    action: 1, // 활성화
+                    ..Default::default()
+                };
+                
+                rules.insert(target_port, new_rule, 0)?;
+                println!("🚀 Rule Added: {}.{}.{}.{}:{}", target_ip[0], target_ip[1], target_ip[2], target_ip[3], target_port);
+            }
+
+            //Del Rule
+            ControlMessage::DeleteRule { target_port } => {
+                let mut rules: HashMap<_, u16, ForwardRule> = 
+                    HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
+
+                rules.remove(&target_port)?;
+                println!("🗑️ Rule Deleted: Port {}", target_port);
+            }
+
+            _ => {}
+        }
+    }
+
+    Ok(())
+
 }
 
 #[tokio::main]
@@ -88,31 +145,27 @@ async fn main() -> anyhow::Result<()> {
         "../../target/bpfel-unknown-none/release/port_forwarding"
     ))?;
 
+    let (tx, rx) = mpsc::channel::<ControlMessage>();
+
+    let tx_for_cli = tx.clone();
+
     config_setup(&mut ebpf)?;
 
-    // match aya_log::EbpfLogger::init(&mut ebpf) {
-    //     Err(e) => {
-    //         // This can happen if you remove all log statements from your eBPF program.
-    //         warn!("failed to initialize eBPF logger: {e}");
-    //     }
-    //     Ok(logger) => {
-    //         let mut logger =
-    //             tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-    //         tokio::task::spawn(async move {
-    //             loop {
-    //                 let mut guard = logger.readable_mut().await.unwrap();
-    //                 guard.get_inner_mut().flush();
-    //                 guard.clear_ready();
-    //             }
-    //         });
-    //     }
-    // }
+
+    let handle = thread::spawn(move || {
+        if let Err(e) = recv_message(ebpf, rx) {
+            eprintln!("Error in message in receiver: {}", e);
+        }
+    });
+    cli::commands_node::cli_prompt(tx_for_cli);
+
     aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
     let Opt { ref iface } = opt;
+
+
     let program: &mut Xdp = ebpf.program_mut("port_forwarding").unwrap().try_into()?;
     program.load()?;
     program.attach(&iface, XdpFlags::SKB_MODE)
-    // program.attach(&iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     let mut stats_map: HashMap<_, u32, InterfaceState> = HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
@@ -120,24 +173,8 @@ async fn main() -> anyhow::Result<()> {
     stats_map.insert(if_index, InterfaceState::default(), 0)?;
     info!("Initialized IFACE_STATS for index {}", if_index);
 
-    {
-        let mut rules: HashMap<_, u16, ForwardRule> = 
-            HashMap::try_from(ebpf.map_mut("RULES").unwrap())?;
-        
-        let http_forward = ForwardRule {
-            target_ip: [192, 168, 4, 146], // 포워딩할 대상 서버 IP
-            target_port: 8080,             // 대상 서버의 포트
-            action: 1,                     // 활성화
-            ..Default::default()
-        };
-        
-        rules.insert(80, http_forward, 0)?;
-        println!("Registered Port Forwarding: 80 -> 192.168.4.146:8080");
-    }
-
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
-    // ctrl_c.await?;
     tokio::signal::ctrl_c().await?;
     println!("Exiting...");
 
