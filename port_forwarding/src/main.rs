@@ -11,7 +11,7 @@ use port_forwarding_common::{InterfaceState, ForwardRule};
 use tokio::signal;
 
 use aya::{include_bytes_aligned, Ebpf};
-use aya::maps::{HashMap};
+use aya::maps::{HashMap, MapData};
 use log::info;
 use std::sync::mpsc;
 
@@ -77,7 +77,7 @@ fn config_setup (ebpf: &mut Ebpf)
     Ok(())
 }
 
-fn recv_message (mut ebpf: Ebpf, rx: mpsc::Receiver<ControlMessage>)
+fn recv_message (mut rules_map: HashMap<MapData, u16, ForwardRule>, rx: mpsc::Receiver<ControlMessage>)
     -> anyhow::Result<()>
 {
     println!("Waiting for commands...");
@@ -86,8 +86,8 @@ fn recv_message (mut ebpf: Ebpf, rx: mpsc::Receiver<ControlMessage>)
         match msg {
             //Add Rule
             ControlMessage::AddRule { target_ip, target_port } => {
-                let mut rules: HashMap<_, u16, ForwardRule> = 
-                    HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
+                // let mut rules: HashMap<_, u16, ForwardRule> = 
+                    // HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
                 
                 let new_rule = ForwardRule {
                     target_ip,
@@ -96,16 +96,16 @@ fn recv_message (mut ebpf: Ebpf, rx: mpsc::Receiver<ControlMessage>)
                     ..Default::default()
                 };
                 
-                rules.insert(target_port, new_rule, 0)?;
+                rules_map.insert(target_port, new_rule, 0)?;
                 println!("🚀 Rule Added: {}.{}.{}.{}:{}", target_ip[0], target_ip[1], target_ip[2], target_ip[3], target_port);
             }
 
             //Del Rule
             ControlMessage::DeleteRule { target_port } => {
-                let mut rules: HashMap<_, u16, ForwardRule> = 
-                    HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
+                // let mut rules: HashMap<_, u16, ForwardRule> = 
+                    // HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
 
-                rules.remove(&target_port)?;
+                rules_map.remove(&target_port)?;
                 println!("🗑️ Rule Deleted: Port {}", target_port);
             }
 
@@ -151,16 +151,23 @@ async fn main() -> anyhow::Result<()> {
 
     config_setup(&mut ebpf)?;
 
-
-    let handle = thread::spawn(move || {
-        if let Err(e) = recv_message(ebpf, rx) {
-            eprintln!("Error in message in receiver: {}", e);
-        }
-    });
     cli::commands_node::cli_prompt(tx_for_cli);
 
     aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
     let Opt { ref iface } = opt;
+
+
+    let rules_raw_map = ebpf.take_map("RULES")
+    .ok_or(anyhow::anyhow!("RULES 맵을 찾을 수 없습니다"))?;
+
+    let mut rules_map: HashMap<MapData, u16, ForwardRule> =
+        HashMap::try_from(rules_raw_map)?;
+
+    let handle = thread::spawn(move || {
+        if let Err(e) = recv_message(rules_map, rx) {
+            eprintln!("Error in message in receiver: {}", e);
+        }
+    });
 
 
     let program: &mut Xdp = ebpf.program_mut("port_forwarding").unwrap().try_into()?;
@@ -169,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     let mut stats_map: HashMap<_, u32, InterfaceState> = HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
+
 
     stats_map.insert(if_index, InterfaceState::default(), 0)?;
     info!("Initialized IFACE_STATS for index {}", if_index);

@@ -16,7 +16,7 @@ use crate::cli::command;
 type ActionFn = fn(Vec<String>, &mpsc::Sender<ControlMessage>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ArgType {
+pub enum ArgType {
     Command,
     Ip,
     Port
@@ -69,7 +69,7 @@ impl CommandNode {
                     None,
                     command.action);
 
-            if command.arg_type ==  Some(ArgType::Command) {
+            if command.arg_type ==  "Command" {
                 self.subcommands.insert( command.command.clone(), node);
             }
             else {
@@ -134,7 +134,8 @@ fn validate_command(arg: &str, arg_type: Option<ArgType>) -> bool {
 }
 
 
-fn action_add_rule(args: Vec<String>, tx: &mpsc::Sender<ControlMessage>) {
+pub fn action_add_rule(args: Vec<String>, tx: &mpsc::Sender<ControlMessage>)
+{
     if args.len() < 2 { return; }
     
     // IP 파싱 (예시: 192.168.4.131)
@@ -147,6 +148,17 @@ fn action_add_rule(args: Vec<String>, tx: &mpsc::Sender<ControlMessage>) {
 
     let msg = ControlMessage::AddRule { target_ip, target_port };
     let _ = tx.send(msg); // main 쓰레드로 전송
+}
+
+pub fn action_remove_rule(
+    args: Vec<String>, tx: &mpsc::Sender<ControlMessage>)
+{
+    if args.len() < 1 { return; }
+
+    let target_port: u16 = args[0].parse().unwrap_or(0);
+
+    let msg = ControlMessage::DeleteRule { target_port };
+    let _ = tx.send(msg);
 }
 
 
@@ -167,8 +179,9 @@ fn execute_command(root: &CommandNode, input: &str, tx: &mpsc::Sender<ControlMes
             current = child;
             if child.arg_type != Some(ArgType::Command) {
                 args.push(part.to_string());
+
                 if !validate_command(part, child.arg_type) {
-                    return
+                    return;
                 }
             }
         }
@@ -180,6 +193,7 @@ fn execute_command(root: &CommandNode, input: &str, tx: &mpsc::Sender<ControlMes
     }
 
     if let Some(action) = current.action {
+        //Execute function that defined make_commands()
         action(args, tx);
     } else {
         println!("\nNo suggestions found.");
@@ -200,28 +214,13 @@ fn suggest_next_commands(command_tree: &CommandNode, input: &str) {
     let mut suggestions: Vec<String> = Vec::new();
 
     if let Some(node) = current_node {
-        // println!("######## Current node: {:#?}", current_node);
 
         for (cmd, subnode) in &node.subcommands {
             suggestions.push(format!("{}: {}", cmd, subnode.description));
         }
-        // if !node.subcommands.is_empty() {
-        //     // suggestions
-        //    let mut test = node.subcommands
-
-        //     // println!("Sub-Commands of '{}': {:?}", node.command, suggestions);
-        //     node.subcommands.iter().for_each(|(cmd, subnode)| {
-        //         println!("  - {}: {}", cmd, subnode.description);
-        //     });
-        // }
-        // if !node.value_child.is_none() {
-            if let Some(node) = node.value_child.as_ref() {
-                // println!("  - <{}>: {}", node.arg_type, node.description);
-                // suggestions.push(&node.description);
-                suggestions.push( format!("{:?}: {:?}", node.command, node.description));
-            }
-            // println!("  - <{}>: {}", node.arg_type, node.value_child.as_ref().unwrap().description);
-        // }
+        if let Some(node) = node.value_child.as_ref() {
+            suggestions.push( format!("{:?}: {:?}", node.command, node.description));
+        }
         println!("\n\rSuggestions: {:#?}", suggestions);
     }
 	else {
