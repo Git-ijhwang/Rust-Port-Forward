@@ -1,28 +1,70 @@
 // use std::collections::HashMap;
-
-use anyhow::Context as _;
-use aya::programs::{Xdp, XdpFlags};
-use clap::Parser;
-#[rustfmt::skip]
-use log::{debug, warn};
-use nix::net::if_::if_nametoindex;
-use port_forwarding_common::{InterfaceState, ForwardRule};
-
-use tokio::signal;
-
-use aya::{include_bytes_aligned, Ebpf};
-use aya::maps::{HashMap, MapData};
-use log::info;
-use std::sync::mpsc;
-
-use dotenvy::dotenv;
-use std::env;
-use aya::maps::Array;
-use port_forwarding_common::GlobalConfig;
 use std::net::Ipv4Addr;
 use std::thread;
+use std::env;
+use std::sync::mpsc;
+use std::time::Duration;
+use std::io;
+
+use anyhow::Context as _;
+use aya::{include_bytes_aligned, Ebpf};
+use aya::maps::{Array, HashMap, MapData};
+use aya::programs::{Xdp, XdpFlags};
+use tokio::signal;
+
+use clap::Parser;
+
+#[rustfmt::skip]
+use log::{debug, warn};
+
+use nix::net::if_::if_nametoindex;
+use log::info;
+use dotenvy::dotenv;
+use futures::StreamExt;
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph},
+    Frame, Terminal,
+};
+
+use port_forwarding_common::{InterfaceState, ForwardRule};
+use port_forwarding_common::GlobalConfig;
 
 mod cli;
+
+pub struct App {
+    pub input: String,
+    pub logs: Vec<String>,
+    pub stats_lines: Vec<String>,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            logs: vec!["System started ...".into()],
+            stats_lines: vec!["No data yet".into()],
+            should_quit: false,
+        }
+    }
+
+    fn push_log<S: Into<String>>(&mut self, line: S) {
+        self.logs.push(line.into());
+        // keep last 200 lines
+        let len = self.logs.len();
+        if len > 200 {
+            self.logs.drain(0..len - 200);
+        }
+    }
+}
 
 pub enum ControlMessage {
     // 새로운 룰 추가: [IP 주소, 타겟 포트]
@@ -117,6 +159,59 @@ fn recv_message (mut rules_map: HashMap<MapData, u16, ForwardRule>, rx: mpsc::Re
 
 }
 
+enum ParsedCmd {
+    Ctrl(ControlMessage),
+    Quit,
+    Info(String),
+    Err(String),
+}
+
+
+fn parse_cmd(line: &str) -> ParsedCmd {
+    let mut it = line.split_whitespace();
+    match it.next() {
+        Some("add") => {
+            let ip_s = match it.next() {
+                Some(s) => s,
+                None => return ParsedCmd::Err("usage: add <ip> <port>".into()),
+            };
+            let port_s = match it.next() {
+                Some(s) => s,
+                None => return ParsedCmd::Err("usage: add <ip> <port>".into()),
+            };
+            let ip: Ipv4Addr = match ip_s.parse() {
+                Ok(v) => v,
+                Err(_) => return ParsedCmd::Err(format!("bad ip: {ip_s}")),
+            };
+            let port: u16 = match port_s.parse() {
+                Ok(v) => v,
+                Err(_) => return ParsedCmd::Err(format!("bad port: {port_s}")),
+            };
+            ParsedCmd::Ctrl(ControlMessage::AddRule {
+                target_ip: ip.octets(),
+                target_port: port,
+            })
+        }
+        Some("del") | Some("rm") => {
+            let port_s = match it.next() {
+                Some(s) => s,
+                None => return ParsedCmd::Err("usage: del <port>".into()),
+            };
+            let port: u16 = match port_s.parse() {
+                Ok(v) => v,
+                Err(_) => return ParsedCmd::Err(format!("bad port: {port_s}")),
+            };
+            ParsedCmd::Ctrl(ControlMessage::DeleteRule { target_port: port })
+        }
+        Some("quit") | Some("exit") | Some("q") => ParsedCmd::Quit,
+        Some("help") | Some("h") | Some("?") => ParsedCmd::Info(
+            "commands: add <ip> <port> | del <port> | quit".into(),
+        ),
+        Some(other) => ParsedCmd::Err(format!("unknown command: {other}")),
+        None => ParsedCmd::Info(String::new()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
@@ -145,46 +240,215 @@ async fn main() -> anyhow::Result<()> {
         "../../target/bpfel-unknown-none/release/port_forwarding"
     ))?;
 
-    let (tx, rx) = mpsc::channel::<ControlMessage>();
-
-    let tx_for_cli = tx.clone();
+    // - let tx_for_cli = tx.clone();
 
     config_setup(&mut ebpf)?;
 
-    cli::commands_node::cli_prompt(tx_for_cli);
+    // - cli::commands_node::cli_prompt(tx_for_cli);
 
     aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
-    let Opt { ref iface } = opt;
+    // - let Opt { ref iface } = opt;
 
 
-    let rules_raw_map = ebpf.take_map("RULES")
-    .ok_or(anyhow::anyhow!("RULES 맵을 찾을 수 없습니다"))?;
+    let program: &mut Xdp = ebpf.program_mut("port_forwarding").unwrap().try_into()?;
+    program.load()?;
+    program.attach(&opt.iface, XdpFlags::SKB_MODE)
+        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
+    {
+        let mut stats_map: HashMap<_, u32, InterfaceState> = HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
+        stats_map.insert(if_index, InterfaceState::default(), 0)?;
+        info!("Initialized IFACE_STATS for index {}", if_index);
+    }
+
+    let stats_raw = ebpf
+        .take_map("IFACE_STATS")
+        .ok_or_else(|| anyhow::anyhow!("IFACE_STATS map missing"))?;
+    let stats_map: HashMap<MapData, u32, InterfaceState> = HashMap::try_from(stats_raw)?;
+
+
+    let rules_raw = ebpf
+        .take_map("RULES")
+        .ok_or_else(|| anyhow::anyhow!("RULES 맵을 찾을 수 없습니다"))?;
     let mut rules_map: HashMap<MapData, u16, ForwardRule> =
-        HashMap::try_from(rules_raw_map)?;
+        HashMap::try_from(rules_raw)?;
 
-    let handle = thread::spawn(move || {
+    let (tx, rx) = mpsc::channel::<ControlMessage>();
+
+    let worker = thread::spawn(move || {
         if let Err(e) = recv_message(rules_map, rx) {
             eprintln!("Error in message in receiver: {}", e);
         }
     });
 
+    let _ebpf_guard = ebpf;
 
-    let program: &mut Xdp = ebpf.program_mut("port_forwarding").unwrap().try_into()?;
-    program.load()?;
-    program.attach(&iface, XdpFlags::SKB_MODE)
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    // ---- TUI ----
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-    let mut stats_map: HashMap<_, u32, InterfaceState> = HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
 
 
-    stats_map.insert(if_index, InterfaceState::default(), 0)?;
-    info!("Initialized IFACE_STATS for index {}", if_index);
+    let app = App::new();
+    let res = run_app(&mut terminal, app, tx, stats_map, if_index).await;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    tokio::signal::ctrl_c().await?;
-    println!("Exiting...");
+        // restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+ 
+    if let Err(e) = res {
+        eprintln!("TUI error: {e}");
+    }
+ 
+    // worker will exit when tx drops (end of this function)
+    drop(worker); // detach; thread exits as channel closes
+ 
+
+    // let ctrl_c = signal::ctrl_c();
+    // println!("Waiting for Ctrl-C...");
+    // tokio::signal::ctrl_c().await?;
+    // println!("Exiting...");
 
     Ok(())
+}
+
+pub async fn run_app <B: Backend> (
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    tx: mpsc::Sender<ControlMessage>,
+    mut stats_map: HashMap<MapData, u32, InterfaceState>,
+    if_index: u32,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    let mut reader = EventStream::new();
+    let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        terminal.draw(|f| ui(f, &app))?;
+
+        tokio::select! {
+            // Some(Ok(evt))
+            maybe_evt = reader.next() => {
+                let Some(Ok(evt)) = maybe_evt else { continue; };
+                if let Event::Key(key) = evt {
+                    if key.kind != KeyEventKind::Press { continue; }
+                    match key.code {
+                        KeyCode::Char(c) => app.input.push(c),
+                        KeyCode::Backspace => { app.input.pop(); },
+                        KeyCode::Enter => {
+                            let line: String = app.input.drain(..).collect();
+                            let trimmed = line.trim();
+
+                            if trimmed.is_empty() {
+                                // write!(stdout, "\n\r> ").unwrap();
+                            } else {
+                                app.push_log(format!("> {}", trimmed));
+                                match parse_cmd(trimmed) {
+                                    ParsedCmd::Ctrl(msg) => {
+                                        let desc = match &msg {
+                                            ControlMessage::AddRule { target_ip, target_port } =>
+                                                format!("ADD {}.{}.{}.{}:{}",
+                                                    target_ip[0], target_ip[1],
+                                                    target_ip[2], target_ip[3],
+                                                    target_port),
+                                            ControlMessage::DeleteRule { target_port } =>
+                                                format!("DEL port {}", target_port),
+                                        };
+                                        match tx.send(msg) {
+                                            Ok(_)  => app.push_log(format!("  ok: {desc}")),
+                                            Err(e) => app.push_log(format!("  send err: {e}")),
+                                        }
+                                    }
+                                    ParsedCmd::Quit => app.should_quit = true,
+                                    ParsedCmd::Info(s) => if !s.is_empty() { app.push_log(s); },
+                                    ParsedCmd::Err(e) => app.push_log(format!("  err: {e}")),
+
+                                }
+                            }
+
+                            // else if input == "exit" || input == "quit" || input == "q"  {
+                            //     writeln!(stdout, "\n\rExiting command interface.").unwrap();
+                            //     break;
+                            // }
+                            // else {
+                            //     writeln!(stdout, "\n\rExecuting command: {}", input).unwrap();
+                            //     execute_command(&command_tree, input.as_str(), &tx);
+                            //     input.clear();
+                            // }
+                            // write!(stdout, "\r> ").unwrap();
+                        }
+                        KeyCode::Esc => app.should_quit = true,
+                        _ => {}
+                    }
+                }
+            }
+
+            _ = stats_interval.tick() => {
+                match stats_map.get(&if_index, 0) {
+                    Ok(state) => {
+                        app.stats_lines = format_stats(if_index, &state);
+                    }
+                    Err(e) => {
+                        app.stats_lines = vec![format!("Failed to read stats: {e}")];  
+                    }
+                }
+            }
+        }
+        if app.should_quit {break;}
+    }
+    Ok(())
+}
+
+fn format_stats(if_index: u32, s: &InterfaceState) -> Vec<String> {
+    vec![
+        format!("Interface idx: {}", if_index),
+        format!("{:#?}", s),
+    ]
+}
+
+pub fn ui(f: &mut ratatui::Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)]) // 메인 영역과 입력창
+        .split(f.area());
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)]) // 통계와 로그
+        .split(chunks[0]);
+
+    // 1. Stats Panel
+    let stats = Paragraph::new(app.stats_lines.join("\n"))
+        .block(Block::default().title(" Network Status ").borders(Borders::ALL));
+    f.render_widget(stats, main_chunks[0]);
+
+
+        // show the tail of the logs so newest lines stay visible
+    let log_area_h = main_chunks[1].height.saturating_sub(2) as usize;
+    let start = app.logs.len().saturating_sub(log_area_h);
+    let log_text = app.logs[start..].join("\n");
+    let logs = Paragraph::new(log_text)
+        .block(Block::default().title(" Sessions & Logs ").borders(Borders::ALL));
+    f.render_widget(logs, main_chunks[1]);
+ 
+    // 2. Log Panel
+    // let logs = Paragraph::new(app.logs.join("\n"))
+        // .block(Block::default().title(" Sessions & Logs ").borders(Borders::ALL));
+    // f.render_widget(logs, main_chunks[1]);
+
+    // 3. CLI Input Panel
+    let input = Paragraph::new(app.input.as_str())
+        .block(Block::default().title(" Command CLI ").borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow)));
+    f.render_widget(input, chunks[1]);
 }
