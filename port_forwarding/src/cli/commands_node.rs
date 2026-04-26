@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use crate::ControlMessage;
 use crate::cli::command;
 
-type ActionFn = fn(Vec<String>, &mpsc::Sender<ControlMessage>);
+type ActionFn = fn(Vec<String>, &mpsc::Sender<ControlMessage>)->Result<String, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ArgType {
@@ -23,7 +23,7 @@ pub enum ArgType {
 }
 
 #[derive(Debug, Clone)]
-struct CommandNode {
+pub struct CommandNode {
     command:        String,
     description:    String,
     subcommands:    HashMap<String, CommandNode>,
@@ -134,39 +134,67 @@ fn validate_command(arg: &str, arg_type: Option<ArgType>) -> bool {
 }
 
 
-pub fn action_add_rule(args: Vec<String>, tx: &mpsc::Sender<ControlMessage>)
+// ---------------------------------------------------------------
+// Actions (now return Result so the TUI can show feedback)
+// ---------------------------------------------------------------
+pub fn action_add_rule(
+    args: Vec<String>,
+    tx: &mpsc::Sender<ControlMessage>
+) -> Result <String, String>
 {
-    if args.len() < 2 { return; }
+    if args.len() < 2 {
+        return Err("usage: add <IP> <Port>".into());
+    }
     
     // IP 파싱 (예시: 192.168.4.131)
-    let ip_parts: Vec<u8> = args[0].split('.')
-        .map(|s| s.parse().unwrap_or(0)).collect();
-    let target_ip: [u8; 4] = [ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]];
+    // let ip_parts: Vec<u8> = args[0i]
+        // .split('.')
+        // .parse()
+        // .map_err(|e| format!("bad ip '{}': not a valid IPv4 address", args[0]))?;
+    let ip: std::net::Ipv4Addr = args[0]
+        .parse()
+        .map_err(|e| format!("bad ip '{}': {e}", args[0]))?;
+
+    // let target_ip: [u8; 4] = [ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]];
+    let target_ip = ip.octets();
     
     // Port 파싱
-    let target_port: u16 = args[1].parse().unwrap_or(0);
+    let target_port: u16 = args[1].parse().map_err(|e| format!("bad port '{}': {e}", args[1]))?;
 
     let msg = ControlMessage::AddRule { target_ip, target_port };
-    let _ = tx.send(msg); // main 쓰레드로 전송
+    tx.send(msg).map_err(|e| format!("Failed to send control message: {e}"))?;
+
+    Ok("Rule addition command sent.".into())
 }
 
 pub fn action_remove_rule(
-    args: Vec<String>, tx: &mpsc::Sender<ControlMessage>)
+    args: Vec<String>,
+    tx: &mpsc::Sender<ControlMessage>
+) -> Result<String, String>
 {
-    if args.len() < 1 { return; }
+    if args.is_empty() { return Err("No arguments provided for remove rule.".into()); }
 
-    let target_port: u16 = args[0].parse().unwrap_or(0);
+    let target_port: u16 = args[0]
+        .parse()
+        .map_err(|e| format!("bad port '{}': {e}", args[0]))?;
 
     let msg = ControlMessage::DeleteRule { target_port };
-    let _ = tx.send(msg);
+    tx.send(msg).map_err(|e| format!("Failed to send control message: {e}"))?;
+
+    Ok("Rule removal command sent.".into())
 }
 
 
-fn execute_command(root: &CommandNode, input: &str, tx: &mpsc::Sender<ControlMessage>) {
+pub fn execute_command(
+    root: &CommandNode,
+    input: &str,
+    tx: &mpsc::Sender<ControlMessage>
+) -> Result<String, String>
+{
     let parts: Vec<&str> = input.trim().split_whitespace().collect();
-
-    println!("\r\nExecuting command with parts: [{:?}]", parts);
-    println!("\r\nCommands Node: {:#?}", root);
+    if parts.is_empty() {
+        return Err("No command entered.".into());
+    }
 
     let mut current = root;
     let mut args: Vec<String> = Vec::new();
@@ -176,56 +204,81 @@ fn execute_command(root: &CommandNode, input: &str, tx: &mpsc::Sender<ControlMes
             current = child;
         }
         else if let Some(child) = current.value_child.as_ref() {
+
+            if !validate_command(part, child.arg_type) {
+                return Err(format!("Invalid argument '{}' for type {:?}",
+                    part, child.arg_type));
+            }
+
             current = child;
             if child.arg_type != Some(ArgType::Command) {
                 args.push(part.to_string());
 
-                if !validate_command(part, child.arg_type) {
-                    return;
-                }
             }
         }
         else {
-            return;
+            return  Err(format!("Command '{}' not found under '{}'", part, current.command));
         }
-
-        println!("\r\nCurrent args: {:?}", args);
     }
 
-    if let Some(action) = current.action {
-        //Execute function that defined make_commands()
-        action(args, tx);
-    } else {
-        println!("\nNo suggestions found.");
+    match current.action {
+        Some(action) => {
+           action(args, &tx);
+           return Ok("Command executed successfully.".into());
+        },
+        None => return Err("incomplete command".into()),
     }
 }
 
 
 
-fn suggest_next_commands(command_tree: &CommandNode, input: &str) {
-
-	let command = if input.is_empty() { "root" } else { input };
-    
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    // println!("Input parts: {:?}", parts);
-
+pub fn suggest_next_commands(command_tree: &CommandNode, input: &str)
+    -> Vec<String>
+{
+    let parts: Vec<&str> = input.split_whitespace().collect();
     let current_node = find_node(command_tree, &parts);
 
+	// let command = if input.is_empty() { "root" } else { input };
+    // println!("Input parts: {:?}", parts);
     let mut suggestions: Vec<String> = Vec::new();
+    let mut lines = Vec::new();
 
-    if let Some(node) = current_node {
+    match current_node {
+        Some(node) => {
+            if !node.subcommands.is_empty() {
+                lines.push("next (keywords):".into());
+                let mut keys: Vec<&String> = node.subcommands.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let sub = &node.subcommands[key];
+                    lines.push(format!("  {}: {}", key, sub.description));
+                }
+            }
 
-        for (cmd, subnode) in &node.subcommands {
-            suggestions.push(format!("{}: {}", cmd, subnode.description));
+            if let Some(vc) = node.value_child.as_ref() {
+                let kind = match vc.arg_type {
+                    Some(ArgType::Ip) => "<IPv4 address>",
+                    Some(ArgType::Port) => "<u16 port>",
+                    _ => "<value>",
+                };
+                lines.push(format!("next (value): {} - {}", kind, vc.description));
+            }
+
+            if lines.is_empty() {
+                if node.action.is_some() {
+                    lines.push("This command can be executed.".into());
+                } else {
+                    lines.push("No further subcommands or values.".into());
+                }
+            }
         }
-        if let Some(node) = node.value_child.as_ref() {
-            suggestions.push( format!("{:?}: {:?}", node.command, node.description));
+        None => {
+            lines.push("No suggestions found.".into());
         }
-        println!("\n\rSuggestions: {:#?}", suggestions);
+
     }
-	else {
-        println!("\rNo suggestions found.");
-    }
+
+    lines
 }
 
 
@@ -247,7 +300,7 @@ fn insert_in_depth<'a> (node: &'a mut CommandNode, command: &command::Command, d
     None
 }
 
-fn build_command_tree() -> CommandNode {
+pub fn build_command_tree() -> CommandNode {
     let commands = command::make_commands();
     let mut root = CommandNode::new(
         "root",

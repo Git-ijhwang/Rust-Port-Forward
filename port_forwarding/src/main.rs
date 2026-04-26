@@ -10,6 +10,8 @@ use anyhow::Context as _;
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::{Array, HashMap, MapData};
 use aya::programs::{Xdp, XdpFlags};
+// use tokio::macros::select;
+use tokio::select;
 use tokio::signal;
 
 use clap::Parser;
@@ -36,6 +38,8 @@ use ratatui::{
 
 use port_forwarding_common::{InterfaceState, ForwardRule};
 use port_forwarding_common::GlobalConfig;
+
+use crate::cli::commands_node::{execute_command, suggest_next_commands, build_command_tree,  CommandNode};
 
 mod cli;
 
@@ -109,7 +113,7 @@ fn config_setup (ebpf: &mut Ebpf)
 
     // Load the global config into the eBPF map
     let mut config_map: Array<_, GlobalConfig> =
-        Array::try_from(ebpf.map_mut("GLOBAL_CONFIG")
+        Array::try_from(ebpf.map_mut("CONFIG")
             .ok_or(anyhow::anyhow!("Failed to get GLOBAL_CONFIG map"))?)?;
     
     // We only have one config, so we use index 0
@@ -212,6 +216,24 @@ fn parse_cmd(line: &str) -> ParsedCmd {
     }
 }
 
+
+// ---------------------------------------------------------------
+// Keywords the tree does not handle: quit/help
+// ---------------------------------------------------------------
+enum SpecialAction {
+    Quit,
+    Help,
+}
+ 
+fn special_keyword(line: &str) -> Option<SpecialAction> {
+    match line.trim() {
+        "quit" | "exit" | "q" => Some(SpecialAction::Quit),
+        "help" | "h" | "?"    => Some(SpecialAction::Help),
+        _ => None,
+    }
+}
+
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
@@ -246,7 +268,11 @@ async fn main() -> anyhow::Result<()> {
 
     // - cli::commands_node::cli_prompt(tx_for_cli);
 
-    aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
+    // aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf){
+        info!("eBPF logger not initialized: {e}");
+    }
+
     // - let Opt { ref iface } = opt;
 
 
@@ -283,6 +309,8 @@ async fn main() -> anyhow::Result<()> {
 
     let _ebpf_guard = ebpf;
 
+    let command_tree = build_command_tree();
+
     // ---- TUI ----
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -293,7 +321,7 @@ async fn main() -> anyhow::Result<()> {
 
 
     let app = App::new();
-    let res = run_app(&mut terminal, app, tx, stats_map, if_index).await;
+    let res = run_app(&mut terminal, app, tx, stats_map, if_index, &command_tree).await;
 
         // restore terminal
     disable_raw_mode()?;
@@ -326,6 +354,8 @@ pub async fn run_app <B: Backend> (
     tx: mpsc::Sender<ControlMessage>,
     mut stats_map: HashMap<MapData, u32, InterfaceState>,
     if_index: u32,
+    command_tree: &CommandNode,
+
 ) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -336,15 +366,34 @@ where
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        tokio::select! {
+        select! {
             // Some(Ok(evt))
             maybe_evt = reader.next() => {
+
                 let Some(Ok(evt)) = maybe_evt else { continue; };
+
                 if let Event::Key(key) = evt {
                     if key.kind != KeyEventKind::Press { continue; }
+
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        app.should_quit = true;
+                        continue;
+                    }
+
                     match key.code {
                         KeyCode::Char(c) => app.input.push(c),
                         KeyCode::Backspace => { app.input.pop(); },
+                        KeyCode::Esc => app.should_quit = true,
+
+                        KeyCode::Tab => {
+                            let lines = suggest_next_commands(command_tree, app.input.trim_end());
+                            for l in lines {
+                                app.push_log(format!("  {l}"));
+                            }
+                        }
+
                         KeyCode::Enter => {
                             let line: String = app.input.drain(..).collect();
                             let trimmed = line.trim();
@@ -353,27 +402,45 @@ where
                                 // write!(stdout, "\n\r> ").unwrap();
                             } else {
                                 app.push_log(format!("> {}", trimmed));
-                                match parse_cmd(trimmed) {
-                                    ParsedCmd::Ctrl(msg) => {
-                                        let desc = match &msg {
-                                            ControlMessage::AddRule { target_ip, target_port } =>
-                                                format!("ADD {}.{}.{}.{}:{}",
-                                                    target_ip[0], target_ip[1],
-                                                    target_ip[2], target_ip[3],
-                                                    target_port),
-                                            ControlMessage::DeleteRule { target_port } =>
-                                                format!("DEL port {}", target_port),
-                                        };
-                                        match tx.send(msg) {
-                                            Ok(_)  => app.push_log(format!("  ok: {desc}")),
-                                            Err(e) => app.push_log(format!("  send err: {e}")),
+
+                                match special_keyword(trimmed) {
+                                    Some(SpecialAction::Quit) => {
+                                        app.should_quit = true;
+                                        // continue;
+                                    }
+                                    Some(SpecialAction::Help) => {
+                                        app.push_log("Available commands: add <ip> <port>, del <port>, quit");
+                                        // continue;
+                                    }
+                                    None => {
+                                        match execute_command(&command_tree, trimmed, &tx) {
+                                            Ok(msg) => app.push_log(format!("Ok:  {msg}")),
+                                            Err(e) => app.push_log(format!("Err: {e}")),
                                         }
                                     }
-                                    ParsedCmd::Quit => app.should_quit = true,
-                                    ParsedCmd::Info(s) => if !s.is_empty() { app.push_log(s); },
-                                    ParsedCmd::Err(e) => app.push_log(format!("  err: {e}")),
-
                                 }
+
+                                // match parse_cmd(trimmed) {
+                                //     ParsedCmd::Ctrl(msg) => {
+                                //         let desc = match &msg {
+                                //             ControlMessage::AddRule { target_ip, target_port } =>
+                                //                 format!("ADD {}.{}.{}.{}:{}",
+                                //                     target_ip[0], target_ip[1],
+                                //                     target_ip[2], target_ip[3],
+                                //                     target_port),
+                                //             ControlMessage::DeleteRule { target_port } =>
+                                //                 format!("DEL port {}", target_port),
+                                //         };
+                                //         match tx.send(msg) {
+                                //             Ok(_)  => app.push_log(format!("  ok: {desc}")),
+                                //             Err(e) => app.push_log(format!("  send err: {e}")),
+                                //         }
+                                //     }
+                                //     ParsedCmd::Quit => app.should_quit = true,
+                                //     ParsedCmd::Info(s) => if !s.is_empty() { app.push_log(s); },
+                                //     ParsedCmd::Err(e) => app.push_log(format!("  err: {e}")),
+
+                                // }
                             }
 
                             // else if input == "exit" || input == "quit" || input == "q"  {
@@ -387,7 +454,6 @@ where
                             // }
                             // write!(stdout, "\r> ").unwrap();
                         }
-                        KeyCode::Esc => app.should_quit = true,
                         _ => {}
                     }
                 }
@@ -404,6 +470,7 @@ where
                 }
             }
         }
+
         if app.should_quit {break;}
     }
     Ok(())
@@ -417,6 +484,7 @@ fn format_stats(if_index: u32, s: &InterfaceState) -> Vec<String> {
 }
 
 pub fn ui(f: &mut ratatui::Frame, app: &App) {
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)]) // 메인 영역과 입력창
@@ -429,11 +497,11 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
 
     // 1. Stats Panel
     let stats = Paragraph::new(app.stats_lines.join("\n"))
-        .block(Block::default().title(" Network Status ").borders(Borders::ALL));
+        .block(Block::default().title(" Network Statu s").borders(Borders::ALL));
     f.render_widget(stats, main_chunks[0]);
 
 
-        // show the tail of the logs so newest lines stay visible
+    // show the tail of the logs so newest lines stay visible
     let log_area_h = main_chunks[1].height.saturating_sub(2) as usize;
     let start = app.logs.len().saturating_sub(log_area_h);
     let log_text = app.logs[start..].join("\n");

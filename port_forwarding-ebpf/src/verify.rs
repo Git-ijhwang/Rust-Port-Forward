@@ -1,6 +1,6 @@
 use network_types::{eth::{EthHdr, EtherType}, ip::{Ipv4Hdr, IpProto}, tcp::TcpHdr, udp::UdpHdr};
 use core::mem;
-use aya_log_ebpf::info;
+// use aya_log_ebpf::info;
 // use crate::XdpContext;
 use aya_ebpf::programs::XdpContext;
 
@@ -39,6 +39,7 @@ pub unsafe fn verify_headers(ctx: &XdpContext)
 
     // 1. Ethernet 파싱
     let eth = unsafe {ptr_at::<EthHdr>(ctx, offset)?};
+
     let mut eth_type = u16::from_be((*eth).ether_type);
     // offset += 14; // Ethernet 헤더 크기
     offset += mem::size_of::<EthHdr>();
@@ -85,7 +86,7 @@ pub unsafe fn verify_headers(ctx: &XdpContext)
             })
         }
         _ => {
-            info!(ctx, "Unsupported L4 protocol:");
+            // info!(ctx, "Unsupported L4 protocol:");
             Err(())
         },
     }

@@ -3,18 +3,31 @@ use network_types::{
     tcp::TcpHdr,
 };
 
+// #[inline(always)]
+// fn update_csum(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
+//     // 1의 보수 합(One's Complement Sum) 연산
+//     // 공식: ~HC' = ~(~HC + ~m + m')
+//     let mut sum = (!old_csum as u32) + (!old_val as u32) + (new_val as u32);
+    
+//     // 32비트 합에서 발생한 캐리(Carry)를 하위 16비트로 반영
+//     while (sum >> 16) != 0 {
+//         sum = (sum & 0xFFFF) + (sum >> 16);
+//     }
+    
+//     !(sum as u16)
+// }
+
+#[inline(always)]
+fn fold32(sum: u32) -> u32 {
+    let s = (sum & 0xFFFF) + (sum >> 16);
+    (s & 0xFFFF) + (s >> 16)
+}
+ 
 #[inline(always)]
 fn update_csum(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
-    // 1의 보수 합(One's Complement Sum) 연산
     // 공식: ~HC' = ~(~HC + ~m + m')
-    let mut sum = (!old_csum as u32) + (!old_val as u32) + (new_val as u32);
-    
-    // 32비트 합에서 발생한 캐리(Carry)를 하위 16비트로 반영
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    
-    !(sum as u16)
+    let sum = (!old_csum as u32) + (!old_val as u32) + (new_val as u32);
+    !(fold32(sum) as u16)
 }
 
 // 32비트 값(IP 주소 등)을 16비트씩 나누어 업데이트하는 헬퍼

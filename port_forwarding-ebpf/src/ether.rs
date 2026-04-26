@@ -2,19 +2,23 @@ use network_types::eth::EthHdr;
 use aya_ebpf::programs::XdpContext;
 use port_forwarding_common::GlobalConfig;
 
-const GW_MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]; // 실제 AP MAC으로 수정
-const MY_MAC: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]; // 내 기기 MAC
-
 #[inline(always)]
-pub fn update_eth_header(
-    // ctx: &XdpContext, eth: &mut EthHdr
-    eth: &mut EthHdr, config: &GlobalConfig)
-    -> Result<(), ()>
-{
-
-    // MAC 주소 업데이트 (예시로 고정된 MAC 주소 사용)
-    eth.src_addr = config.my_mac;
-    eth.dst_addr = config.gw_mac;
-
+pub fn update_eth_header(eth: &mut EthHdr, config: &GlobalConfig) -> Result<(), ()> {
+    // Copy MY_MAC -> src_addr, byte by byte
+    eth.src_addr[0] = config.my_mac[0];
+    eth.src_addr[1] = config.my_mac[1];
+    eth.src_addr[2] = config.my_mac[2];
+    eth.src_addr[3] = config.my_mac[3];
+    eth.src_addr[4] = config.my_mac[4];
+    eth.src_addr[5] = config.my_mac[5];
+ 
+    // Copy GW_MAC -> dst_addr, byte by byte
+    eth.dst_addr[0] = config.gw_mac[0];
+    eth.dst_addr[1] = config.gw_mac[1];
+    eth.dst_addr[2] = config.gw_mac[2];
+    eth.dst_addr[3] = config.gw_mac[3];
+    eth.dst_addr[4] = config.gw_mac[4];
+    eth.dst_addr[5] = config.gw_mac[5];
+ 
     Ok(())
 }

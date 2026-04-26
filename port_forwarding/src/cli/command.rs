@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use crate::ControlMessage;
 use crate::cli::commands_node::{action_add_rule, action_remove_rule};
 
-type ActionFn = fn(Vec<String>, &mpsc::Sender<ControlMessage>);
+type ActionFn = fn(Vec<String>, &mpsc::Sender<ControlMessage>) -> Result<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct Command {
@@ -51,7 +51,7 @@ pub fn make_commands() -> Vec<Command> {
     let mut commands = Vec::new();
 
     // Create the hierarchical structure of commands
-    commands.push(Command::new("add",   "root", 0,  "Add a Rule",        "Command",  None));
+    commands.push(Command::new("add",   "root", 0,  "Add a Rule",           "Command",  None));
     commands.push(Command::new("ip",    "add",  1,  "Target IP Address",    "IP",       None));
     commands.push(Command::new("port",  "ip",   2,  "Target Port",          "Port",     Some(action_add_rule)));
 
