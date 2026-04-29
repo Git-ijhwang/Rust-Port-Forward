@@ -3,6 +3,7 @@
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardRule {
+    // pub listen_port: u16,
     pub target_ip: [u8; 4],
     pub target_port: u16,
     pub action: u32,      // 0: Pass, 1: Drop/Count

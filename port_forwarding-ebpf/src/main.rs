@@ -42,7 +42,9 @@ pub static IFACE_STATS: HashMap<u32, InterfaceState> = HashMap::with_max_entries
 pub static CONFIG: Array<GlobalConfig> = Array::with_max_entries(1, 0);
 
 #[xdp]
-pub fn port_forwarding(ctx: XdpContext) -> u32 {
+pub fn port_forwarding(ctx: XdpContext)
+    -> u32
+{
     match try_port_forwarding(ctx) {
         Ok(ret) => ret,
         Err(_) => xdp_action::XDP_ABORTED,
@@ -51,7 +53,9 @@ pub fn port_forwarding(ctx: XdpContext) -> u32 {
 
 
 #[inline(always)]
-fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &PacketContext)
+fn insert_inverse_mapping ( ctx: &XdpContext,
+                            rule: *mut ForwardRule,
+                            packet: &PacketContext )
     -> Result<(), ()>
 {
     let ip_hdr = unsafe {&mut * (packet.ip_hdr as *mut Ipv4Hdr)};
@@ -79,7 +83,40 @@ fn insert_inverse_mapping (ctx: &XdpContext, rule: *mut ForwardRule, packet: &Pa
 }
 
 
-fn try_restore_response(ctx: &XdpContext, packet: &PacketContext, config: &GlobalConfig)
+/*
+fn header_update( ctx: &XdpContext,
+                  packet: &PacketContext,
+                  config: &GlobalConfig,
+                  new_dip: [u8;4] )
+    -> Result<u32, ()>
+{
+    unsafe {
+        let eth_hdr = &mut *ptr_at::<EthHdr>(&ctx, 0)?;
+        let ip_hdr =  &mut *ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)?;
+        let tcp_hdr =  &mut *ptr_at::<TcpHdr>(&ctx, packet.l4_hdr_start)?;
+
+        let old_sip = ip_hdr.src_addr;
+        let old_dip = ip_hdr.dst_addr;
+        let old_sport = tcp_hdr.source;
+        let old_dport = tcp_hdr.dest;
+
+        let new_sip = config.my_ip;
+        //let new_dip;
+        let new_dip = new_dip;
+    }
+
+    update_ip_checksum(ip_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr);
+    update_tcp_checksum(tcp_hdr, old_sip, ip_hdr.src_addr, old_dip, ip_hdr.dst_addr, old_sport, tcp_hdr.source);
+    update_eth_header(eth_hdr, config);
+
+    Ok(xdp_action::XDP_TX)
+}
+    */
+
+
+fn try_restore_response( ctx: &XdpContext,
+                         packet: &PacketContext,
+                         config: &GlobalConfig )
     -> Result<u32, ()>
 {
     let sess_key = SessionKey {
@@ -87,11 +124,6 @@ fn try_restore_response(ctx: &XdpContext, packet: &PacketContext, config: &Globa
         target_port: packet.sport,
         ebpf_port: packet.dport,
     };
-
-    // let sess_val = 
-    //     Some(v) => v,
-    //     None => return Err(()), 
-    // };
 
     let sess_val: &SessionValue =match unsafe {INVERSE_MAP.get(&sess_key) } {
         Some(v) => v,
@@ -127,7 +159,9 @@ fn try_restore_response(ctx: &XdpContext, packet: &PacketContext, config: &Globa
 }
 
 
-fn try_port_forwarding(ctx: XdpContext) -> Result<u32, ()> {
+fn try_port_forwarding( ctx: XdpContext )
+    -> Result<u32, ()>
+{
 
     let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     let _len = (ctx.data_end() - ctx.data()) as u64;

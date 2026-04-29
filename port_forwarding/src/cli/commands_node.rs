@@ -137,59 +137,61 @@ fn validate_command(arg: &str, arg_type: Option<ArgType>) -> bool {
 // ---------------------------------------------------------------
 // Actions (now return Result so the TUI can show feedback)
 // ---------------------------------------------------------------
-pub fn action_add_rule(
-    args: Vec<String>,
-    tx: &mpsc::Sender<ControlMessage>
-) -> Result <String, String>
+pub fn action_add_rule( args: Vec<String>,
+                        tx: &mpsc::Sender<ControlMessage> )
+    -> Result <String, String>
 {
-    if args.len() < 2 {
+    if args.len() < 3 {
         return Err("usage: add <IP> <Port>".into());
     }
     
-    // IP 파싱 (예시: 192.168.4.131)
-    // let ip_parts: Vec<u8> = args[0i]
-        // .split('.')
-        // .parse()
-        // .map_err(|e| format!("bad ip '{}': not a valid IPv4 address", args[0]))?;
-    let ip: std::net::Ipv4Addr = args[0]
+    let listen_port = args[0]
+        .parse().map_err(|e| format!("bad listen port '{}': {e}", args[0]))?;
+
+    let ip: std::net::Ipv4Addr = args[1]
         .parse()
-        .map_err(|e| format!("bad ip '{}': {e}", args[0]))?;
+        .map_err(|e| format!("bad ip '{}': {e}", args[1]))?;
 
     // let target_ip: [u8; 4] = [ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]];
     let target_ip = ip.octets();
     
     // Port 파싱
-    let target_port: u16 = args[1].parse().map_err(|e| format!("bad port '{}': {e}", args[1]))?;
+    let target_port: u16 = args[2].parse().map_err(|e| format!("bad port '{}': {e}", args[2]))?;
 
-    let msg = ControlMessage::AddRule { target_ip, target_port };
+    let msg = ControlMessage::AddRule {listen_port, target_ip, target_port };
     tx.send(msg).map_err(|e| format!("Failed to send control message: {e}"))?;
 
     Ok("Rule addition command sent.".into())
 }
 
-pub fn action_remove_rule(
-    args: Vec<String>,
-    tx: &mpsc::Sender<ControlMessage>
-) -> Result<String, String>
+pub fn action_remove_rule( args: Vec<String>,
+                           tx: &mpsc::Sender<ControlMessage> )
+    -> Result<String, String>
 {
     if args.is_empty() { return Err("No arguments provided for remove rule.".into()); }
 
-    let target_port: u16 = args[0]
+    let listen_port: u16 = args[0]
         .parse()
         .map_err(|e| format!("bad port '{}': {e}", args[0]))?;
 
-    let msg = ControlMessage::DeleteRule { target_port };
+    let msg = ControlMessage::DeleteRule { listen_port };
     tx.send(msg).map_err(|e| format!("Failed to send control message: {e}"))?;
 
     Ok("Rule removal command sent.".into())
 }
 
+pub fn action_show_rule( args: Vec<String>,
+                         tx: &mpsc::Sender<ControlMessage> )
+    -> Result<String, String>
+{
+    // Implementation for showing rule
+    Ok("Rule shown.".into())
+}
 
-pub fn execute_command(
-    root: &CommandNode,
-    input: &str,
-    tx: &mpsc::Sender<ControlMessage>
-) -> Result<String, String>
+pub fn execute_command( root: &CommandNode,
+                        input: &str,
+                        tx: &mpsc::Sender<ControlMessage> )
+    -> Result<String, String>
 {
     let parts: Vec<&str> = input.trim().split_whitespace().collect();
     if parts.is_empty() {
@@ -282,6 +284,7 @@ pub fn suggest_next_commands(command_tree: &CommandNode, input: &str)
 }
 
 
+/*
 fn insert_in_depth<'a> (node: &'a mut CommandNode, command: &command::Command, depth: u32)
 -> Option<&'a mut CommandNode>
 {
@@ -299,8 +302,11 @@ fn insert_in_depth<'a> (node: &'a mut CommandNode, command: &command::Command, d
 
     None
 }
+*/
 
-pub fn build_command_tree() -> CommandNode {
+pub fn build_command_tree()
+    -> CommandNode
+{
     let commands = command::make_commands();
     let mut root = CommandNode::new(
         "root",
@@ -317,6 +323,7 @@ pub fn build_command_tree() -> CommandNode {
 }
 
 
+/*
 pub fn cli_prompt(tx: mpsc::Sender<ControlMessage>)
     -> Result<(), String>
 {
@@ -392,3 +399,4 @@ pub fn cli_prompt(tx: mpsc::Sender<ControlMessage>)
 
     Ok(())
 }
+*/

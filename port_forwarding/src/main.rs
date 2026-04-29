@@ -1,33 +1,28 @@
-// use std::collections::HashMap;
+use std::io;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::env;
 use std::sync::mpsc;
 use std::time::Duration;
-use std::io;
 
 use anyhow::Context as _;
 use aya::{include_bytes_aligned, Ebpf};
 use aya::maps::{Array, HashMap, MapData};
 use aya::programs::{Xdp, XdpFlags};
-// use tokio::macros::select;
-use tokio::select;
-use tokio::signal;
 
 use clap::Parser;
-
-#[rustfmt::skip]
-use log::{debug, warn};
-
-use nix::net::if_::if_nametoindex;
-use log::info;
 use dotenvy::dotenv;
-use futures::StreamExt;
+use nix::net::if_::if_nametoindex;
+
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::StreamExt;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -36,50 +31,68 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use port_forwarding_common::{InterfaceState, ForwardRule};
-use port_forwarding_common::GlobalConfig;
+#[rustfmt::skip]
+use log::{debug, info};
 
-use crate::cli::commands_node::{execute_command, suggest_next_commands, build_command_tree,  CommandNode};
+use port_forwarding_common::{ForwardRule, GlobalConfig, InterfaceState};
 
 mod cli;
+use cli::commands_node::{
+    build_command_tree, execute_command, suggest_next_commands, CommandNode,
+};
+
+// ---------------------------------------------------------------
+// Channel messages
+// ---------------------------------------------------------------
+
+/// TUI -> worker
+pub enum ControlMessage {
+    AddRule {listen_port:u16, target_ip: [u8; 4], target_port: u16 },
+    DeleteRule { listen_port: u16 },
+    ShowRule,
+}
+
+/// worker -> TUI
+pub enum WorkerResponse {
+    /// Snapshot of all current rules. (listen_port, target_ip, target_port, packets)
+    RuleList(Vec<(u16, [u8; 4], u16, u64)>),
+    /// Worker-side error to display in the Shell.
+    Err(String),
+}
+
+// ---------------------------------------------------------------
+// TUI application state
+// ---------------------------------------------------------------
 
 pub struct App {
     pub input: String,
-    pub logs: Vec<String>,
-    pub stats_lines: Vec<String>,
+    pub shell_lines: Vec<String>,    // Shell panel: prompt history + output
+    pub stats_lines: Vec<String>,    // Network Status panel
+    pub rules_lines: Vec<String>,    // Active Rules panel
     pub should_quit: bool,
 }
 
 impl App {
     pub fn new() -> Self {
-        Self {
+        let mut s = Self {
             input: String::new(),
-            logs: vec!["System started ...".into()],
+            shell_lines: Vec::new(),
             stats_lines: vec!["No data yet".into()],
+            rules_lines: vec!["No active rules".into()],
             should_quit: false,
-        }
+        };
+        s.push_shell("System started.");
+        s.push_shell("Type 'help' or press Tab for suggestions.");
+        s
     }
 
-    fn push_log<S: Into<String>>(&mut self, line: S) {
-        self.logs.push(line.into());
-        // keep last 200 lines
-        let len = self.logs.len();
-        if len > 200 {
-            self.logs.drain(0..len - 200);
+    fn push_shell<S: Into<String>>(&mut self, line: S) {
+        self.shell_lines.push(line.into());
+        let len = self.shell_lines.len();
+        if len > 500 {
+            self.shell_lines.drain(0..len - 500);
         }
     }
-}
-
-pub enum ControlMessage {
-    // 새로운 룰 추가: [IP 주소, 타겟 포트]
-    AddRule {
-        target_ip: [u8; 4],
-        target_port: u16,
-    },
-    // 특정 포트의 룰 삭제
-    DeleteRule {
-        target_port: u16,
-    },
 }
 
 #[derive(Debug, Parser)]
@@ -88,162 +101,117 @@ struct Opt {
     iface: String,
 }
 
-fn config_setup (ebpf: &mut Ebpf)
-    -> Result<(), anyhow::Error>
-{
+// ---------------------------------------------------------------
+// Global config setup
+// ---------------------------------------------------------------
+
+fn config_setup(ebpf: &mut Ebpf) -> anyhow::Result<()> {
     dotenv().ok();
 
     let parse_mac = |key: &str| -> [u8; 6] {
         let mut res = [0u8; 6];
         let s = env::var(key).expect("Missing env key");
-
-        for (i, b) in s.split(":").map(|b| u8::from_str_radix(b, 16).unwrap()).enumerate() {
+        for (i, b) in s.split(':').map(|b| u8::from_str_radix(b, 16).unwrap()).enumerate() {
             res[i] = b;
         }
-
-        println!("Parsed MAC for {}: {:02x?}", key, res);
         res
     };
 
     let config = GlobalConfig {
         gw_mac: parse_mac("GW_MAC"),
         my_mac: parse_mac("MY_MAC"),
-        my_ip: env::var("MY_IP")?.parse::<Ipv4Addr>()?.octets(),
+        my_ip:  env::var("MY_IP")?.parse::<Ipv4Addr>()?.octets(),
     };
 
-    // Load the global config into the eBPF map
-    let mut config_map: Array<_, GlobalConfig> =
-        Array::try_from(ebpf.map_mut("CONFIG")
-            .ok_or(anyhow::anyhow!("Failed to get GLOBAL_CONFIG map"))?)?;
-    
-    // We only have one config, so we use index 0
-    config_map.set(0, &config, 0)?;
+    let mut config_map: Array<_, GlobalConfig> = Array::try_from(
+        ebpf.map_mut("CONFIG")
+            .ok_or_else(|| anyhow::anyhow!("Failed to get GLOBAL_CONFIG map"))?,
+    )?;
 
-    println!("Global Config loaded into eBPF map");
+    // let mut config_map: Array<_, GlobalConfig> =
+    //     Array::try_from(ebpf.map_mut("CONFIG")
+    //         .ok_or(anyhow::anyhow!("Failed to get GLOBAL_CONFIG map"))?)?;
+
+    config_map.set(0, &config, 0)?;
     Ok(())
 }
 
-fn recv_message (mut rules_map: HashMap<MapData, u16, ForwardRule>, rx: mpsc::Receiver<ControlMessage>)
-    -> anyhow::Result<()>
-{
-    println!("Waiting for commands...");
+// ---------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------
 
-    while let Ok(msg) = rx.recv() {
+fn recv_message( mut rules_map: HashMap<MapData, u16, ForwardRule>,
+                 cmd_rx: mpsc::Receiver<ControlMessage>,
+                 resp_tx: mpsc::Sender<WorkerResponse>,)
+-> anyhow::Result<()>
+{
+    while let Ok(msg) = cmd_rx.recv() {
         match msg {
-            //Add Rule
-            ControlMessage::AddRule { target_ip, target_port } => {
-                // let mut rules: HashMap<_, u16, ForwardRule> = 
-                    // HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
-                
+            ControlMessage::AddRule {listen_port, target_ip, target_port } => {
                 let new_rule = ForwardRule {
                     target_ip,
                     target_port,
-                    action: 1, // 활성화
+                    action: 1,
                     ..Default::default()
                 };
-                
-                rules_map.insert(target_port, new_rule, 0)?;
-                println!("🚀 Rule Added: {}.{}.{}.{}:{}", target_ip[0], target_ip[1], target_ip[2], target_ip[3], target_port);
+                if let Err(e) = rules_map.insert(listen_port, new_rule, 0) {
+                    let _ = resp_tx.send(WorkerResponse::Err(format!("insert failed: {e}")));
+                }
             }
 
-            //Del Rule
-            ControlMessage::DeleteRule { target_port } => {
-                // let mut rules: HashMap<_, u16, ForwardRule> = 
-                    // HashMap::try_from(ebpf.map_mut("RULES").ok_or(anyhow::anyhow!("Map not found"))?)?;
-
-                rules_map.remove(&target_port)?;
-                println!("🗑️ Rule Deleted: Port {}", target_port);
+            ControlMessage::DeleteRule { listen_port } => {
+                if let Err(e) = rules_map.remove(&listen_port) {
+                    let _ = resp_tx.send(WorkerResponse::Err(format!("remove failed: {e}")));
+                }
             }
 
-            _ => {}
+            ControlMessage::ShowRule => {
+                let mut rules: Vec<(u16, [u8; 4], u16, u64)> = Vec::new();
+                for entry in rules_map.iter() {
+                    if let Ok((port, rule)) = entry {
+                        rules.push((port, rule.target_ip, rule.target_port, rule.packets));
+                    }
+                }
+                rules.sort_by_key(|(p, _, _, _)| *p);
+                let _ = resp_tx.send(WorkerResponse::RuleList(rules));
+            }
         }
     }
-
     Ok(())
-
 }
-
-enum ParsedCmd {
-    Ctrl(ControlMessage),
-    Quit,
-    Info(String),
-    Err(String),
-}
-
-
-fn parse_cmd(line: &str) -> ParsedCmd {
-    let mut it = line.split_whitespace();
-    match it.next() {
-        Some("add") => {
-            let ip_s = match it.next() {
-                Some(s) => s,
-                None => return ParsedCmd::Err("usage: add <ip> <port>".into()),
-            };
-            let port_s = match it.next() {
-                Some(s) => s,
-                None => return ParsedCmd::Err("usage: add <ip> <port>".into()),
-            };
-            let ip: Ipv4Addr = match ip_s.parse() {
-                Ok(v) => v,
-                Err(_) => return ParsedCmd::Err(format!("bad ip: {ip_s}")),
-            };
-            let port: u16 = match port_s.parse() {
-                Ok(v) => v,
-                Err(_) => return ParsedCmd::Err(format!("bad port: {port_s}")),
-            };
-            ParsedCmd::Ctrl(ControlMessage::AddRule {
-                target_ip: ip.octets(),
-                target_port: port,
-            })
-        }
-        Some("del") | Some("rm") => {
-            let port_s = match it.next() {
-                Some(s) => s,
-                None => return ParsedCmd::Err("usage: del <port>".into()),
-            };
-            let port: u16 = match port_s.parse() {
-                Ok(v) => v,
-                Err(_) => return ParsedCmd::Err(format!("bad port: {port_s}")),
-            };
-            ParsedCmd::Ctrl(ControlMessage::DeleteRule { target_port: port })
-        }
-        Some("quit") | Some("exit") | Some("q") => ParsedCmd::Quit,
-        Some("help") | Some("h") | Some("?") => ParsedCmd::Info(
-            "commands: add <ip> <port> | del <port> | quit".into(),
-        ),
-        Some(other) => ParsedCmd::Err(format!("unknown command: {other}")),
-        None => ParsedCmd::Info(String::new()),
-    }
-}
-
 
 // ---------------------------------------------------------------
-// Keywords the tree does not handle: quit/help
+// Special words handled by the TUI itself (not the command tree)
 // ---------------------------------------------------------------
+
 enum SpecialAction {
     Quit,
     Help,
+    Show,
 }
- 
+
 fn special_keyword(line: &str) -> Option<SpecialAction> {
     match line.trim() {
         "quit" | "exit" | "q" => Some(SpecialAction::Quit),
         "help" | "h" | "?"    => Some(SpecialAction::Help),
+        "show"                => Some(SpecialAction::Show),
         _ => None,
     }
 }
 
+// ---------------------------------------------------------------
+// main
+// ---------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
-
     env_logger::init();
 
     let if_index = if_nametoindex("wlp3s0").context("failed to get interface index")?;
+    // let if_index = if_nametoindex(opt.iface.as_str())
+        // .context("failed to get interface index")?;
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -253,36 +221,24 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let mut ebpf = aya::Ebpf::load(include_bytes_aligned!(
-        // concat!( env!("OUT_DIR"), "/port_forwarding")
         "../../target/bpfel-unknown-none/release/port_forwarding"
     ))?;
 
-    // - let tx_for_cli = tx.clone();
-
     config_setup(&mut ebpf)?;
-
-    // - cli::commands_node::cli_prompt(tx_for_cli);
-
-    // aya_log::EbpfLogger::init(&mut ebpf).context("failed to initialize eBPF logger")?;
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf){
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
         info!("eBPF logger not initialized: {e}");
     }
 
-    // - let Opt { ref iface } = opt;
-
-
     let program: &mut Xdp = ebpf.program_mut("port_forwarding").unwrap().try_into()?;
     program.load()?;
-    program.attach(&opt.iface, XdpFlags::SKB_MODE)
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    program
+        .attach(&opt.iface, XdpFlags::SKB_MODE)
+        .context("failed to attach XDP (SKB_MODE)")?;
 
     {
-        let mut stats_map: HashMap<_, u32, InterfaceState> = HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
+        let mut stats_map: HashMap<_, u32, InterfaceState> =
+            HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
         stats_map.insert(if_index, InterfaceState::default(), 0)?;
         info!("Initialized IFACE_STATS for index {}", if_index);
     }
@@ -290,233 +246,298 @@ async fn main() -> anyhow::Result<()> {
     let stats_raw = ebpf
         .take_map("IFACE_STATS")
         .ok_or_else(|| anyhow::anyhow!("IFACE_STATS map missing"))?;
-    let stats_map: HashMap<MapData, u32, InterfaceState> = HashMap::try_from(stats_raw)?;
 
+    let stats_map: HashMap<MapData, u32, InterfaceState> = HashMap::try_from(stats_raw)?;
 
     let rules_raw = ebpf
         .take_map("RULES")
-        .ok_or_else(|| anyhow::anyhow!("RULES 맵을 찾을 수 없습니다"))?;
-    let mut rules_map: HashMap<MapData, u16, ForwardRule> =
-        HashMap::try_from(rules_raw)?;
+        .ok_or_else(|| anyhow::anyhow!("RULES map missing"))?;
+    let rules_map: HashMap<MapData, u16, ForwardRule> = HashMap::try_from(rules_raw)?;
 
-    let (tx, rx) = mpsc::channel::<ControlMessage>();
+    //Channel Creation
+    let (cmd_tx,  cmd_rx)  = mpsc::channel::<ControlMessage>();
+    let (resp_tx, resp_rx) = mpsc::channel::<WorkerResponse>();
 
-    let worker = thread::spawn(move || {
-        if let Err(e) = recv_message(rules_map, rx) {
-            eprintln!("Error in message in receiver: {}", e);
+    /*
+        Spawn worker thread to receive TUI commands and interact with eBPF maps.
+    */
+    let _worker = thread::spawn(move || {
+        if let Err(e) = recv_message(rules_map, cmd_rx, resp_tx) {
+            eprintln!("recv_message error: {e}");
         }
     });
 
     let _ebpf_guard = ebpf;
-
     let command_tree = build_command_tree();
 
-    // ---- TUI ----
     enable_raw_mode()?;
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-
-
     let app = App::new();
-    let res = run_app(&mut terminal, app, tx, stats_map, if_index, &command_tree).await;
+    let res = run_app( &mut terminal, app,
+                                            cmd_tx, resp_rx,
+                                            stats_map, if_index,
+                                            &command_tree,)
+        .await;
 
-        // restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+
+    execute!( terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
- 
+
     if let Err(e) = res {
         eprintln!("TUI error: {e}");
     }
- 
-    // worker will exit when tx drops (end of this function)
-    drop(worker); // detach; thread exits as channel closes
- 
-
-    // let ctrl_c = signal::ctrl_c();
-    // println!("Waiting for Ctrl-C...");
-    // tokio::signal::ctrl_c().await?;
-    // println!("Exiting...");
 
     Ok(())
 }
 
-pub async fn run_app <B: Backend> (
-    terminal: &mut Terminal<B>,
-    mut app: App,
-    tx: mpsc::Sender<ControlMessage>,
-    mut stats_map: HashMap<MapData, u32, InterfaceState>,
-    if_index: u32,
-    command_tree: &CommandNode,
 
-) -> anyhow::Result<()>
+fn handle_enter( app: &mut App,
+                 command_tree: &CommandTree,
+                 tx: &Sender<ControlMessage>,
+                 echo_show_to_shell: &mut bool,)
+{
+    let line: String = app.input.drain(..).collect();
+    let trimmed = line.trim();
+
+    app.push_shell(format!("> {}", trimmed));
+    if trimmed.is_empty() {
+        return;
+    }
+
+    match special_keyword(trimmed) {
+        Some(SpecialAction::Quit) => {
+            app.should_quit = true;
+        }
+        Some(SpecialAction::Help) => {
+            app.push_shell(
+                "commands: add <Listen Port> <Target IP> <Target Port> | remove <Listen Port> | show | quit"
+                    .to_string(),
+            );
+        }
+
+        Some(SpecialAction::Show) => {
+            *echo_show_to_shell = true;
+            let _ = tx.send(ControlMessage::ShowRule);
+        }
+
+        None => {
+            match execute_command(command_tree, trimmed, &tx) {
+                Ok(msg) => {
+                    app.push_shell(format!("  ok: {msg}"));
+                    // immediate Active Rules refresh
+                    let _ = tx.send(ControlMessage::ShowRule);
+                }
+                Err(e) => {
+                    app.push_shell(format!("  err: {e}"));
+                }
+            }
+        }
+    }
+}
+
+//
+// Process for the Users Key input
+//
+fn key_input_event( key: KeyEvent,
+              app: &mut App,
+              command_tree: &CommandTree,
+              tx: &Sender<ControlMessage>,
+              echo_show_to_shell: &mut bool,)
+{
+    let mut reader = EventStream::new();
+
+    if let Event::Key(key) = evt {
+        if key.kind != KeyEventKind::Press { return; }
+
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            app.should_quit = true;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(c) => app.input.push(c),
+            KeyCode::Backspace => { app.input.pop(); }
+            KeyCode::Esc => app.should_quit = true,
+
+            KeyCode::Tab => {
+                let lines = suggest_next_commands(
+                    command_tree,
+                    app.input.trim_end(),
+                );
+                for l in lines { app.push_shell(l); }
+            }
+
+            KeyCode::Enter => handle_enter(app, command_tree, tx, echo_show_to_shell),
+
+            _ => {}
+        }
+    }
+}
+// ---------------------------------------------------------------
+// TUI main loop
+// ---------------------------------------------------------------
+
+pub async fn run_app<B: Backend> ( terminal: &mut Terminal<B>,
+                                   mut app: App,
+                                   tx: mpsc::Sender<ControlMessage>,
+                                   resp_rx: mpsc::Receiver<WorkerResponse>,
+                                   mut stats_map: HashMap<MapData, u32, InterfaceState>,
+                                   if_index: u32,
+                                   command_tree: &CommandNode )
+-> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut reader = EventStream::new();
-    let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_millis(1000));
+    let mut resp_poll = tokio::time::interval(Duration::from_millis(50));
+
+    // When set, the next RuleList response is also echoed into the Shell panel.
+    let mut echo_show_to_shell = false;
+
+    // Kick off an initial snapshot so Active Rules isn't blank for ~1s
+    let _ = tx.send(ControlMessage::ShowRule);
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        select! {
-            // Some(Ok(evt))
+        tokio::select! {
+
+            // ----- Keyboard input -----
             maybe_evt = reader.next() => {
-
-                let Some(Ok(evt)) = maybe_evt else { continue; };
-
+                let Some(Ok(evt)) = maybe_evt else { continue };
                 if let Event::Key(key) = evt {
-                    if key.kind != KeyEventKind::Press { continue; }
-
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        app.should_quit = true;
-                        continue;
-                    }
-
-                    match key.code {
-                        KeyCode::Char(c) => app.input.push(c),
-                        KeyCode::Backspace => { app.input.pop(); },
-                        KeyCode::Esc => app.should_quit = true,
-
-                        KeyCode::Tab => {
-                            let lines = suggest_next_commands(command_tree, app.input.trim_end());
-                            for l in lines {
-                                app.push_log(format!("  {l}"));
-                            }
-                        }
-
-                        KeyCode::Enter => {
-                            let line: String = app.input.drain(..).collect();
-                            let trimmed = line.trim();
-
-                            if trimmed.is_empty() {
-                                // write!(stdout, "\n\r> ").unwrap();
-                            } else {
-                                app.push_log(format!("> {}", trimmed));
-
-                                match special_keyword(trimmed) {
-                                    Some(SpecialAction::Quit) => {
-                                        app.should_quit = true;
-                                        // continue;
-                                    }
-                                    Some(SpecialAction::Help) => {
-                                        app.push_log("Available commands: add <ip> <port>, del <port>, quit");
-                                        // continue;
-                                    }
-                                    None => {
-                                        match execute_command(&command_tree, trimmed, &tx) {
-                                            Ok(msg) => app.push_log(format!("Ok:  {msg}")),
-                                            Err(e) => app.push_log(format!("Err: {e}")),
-                                        }
-                                    }
-                                }
-
-                                // match parse_cmd(trimmed) {
-                                //     ParsedCmd::Ctrl(msg) => {
-                                //         let desc = match &msg {
-                                //             ControlMessage::AddRule { target_ip, target_port } =>
-                                //                 format!("ADD {}.{}.{}.{}:{}",
-                                //                     target_ip[0], target_ip[1],
-                                //                     target_ip[2], target_ip[3],
-                                //                     target_port),
-                                //             ControlMessage::DeleteRule { target_port } =>
-                                //                 format!("DEL port {}", target_port),
-                                //         };
-                                //         match tx.send(msg) {
-                                //             Ok(_)  => app.push_log(format!("  ok: {desc}")),
-                                //             Err(e) => app.push_log(format!("  send err: {e}")),
-                                //         }
-                                //     }
-                                //     ParsedCmd::Quit => app.should_quit = true,
-                                //     ParsedCmd::Info(s) => if !s.is_empty() { app.push_log(s); },
-                                //     ParsedCmd::Err(e) => app.push_log(format!("  err: {e}")),
-
-                                // }
-                            }
-
-                            // else if input == "exit" || input == "quit" || input == "q"  {
-                            //     writeln!(stdout, "\n\rExiting command interface.").unwrap();
-                            //     break;
-                            // }
-                            // else {
-                            //     writeln!(stdout, "\n\rExecuting command: {}", input).unwrap();
-                            //     execute_command(&command_tree, input.as_str(), &tx);
-                            //     input.clear();
-                            // }
-                            // write!(stdout, "\r> ").unwrap();
-                        }
-                        _ => {}
-                    }
+                    key_input_event( key, &mut app, command_tree, &tx, &mut echo_show_to_shell,);
                 }
             }
 
-            _ = stats_interval.tick() => {
+
+            // ----- 1s tick: stats poll + rules snapshot request -----
+            _ = tick.tick() => {
                 match stats_map.get(&if_index, 0) {
                     Ok(state) => {
                         app.stats_lines = format_stats(if_index, &state);
                     }
                     Err(e) => {
-                        app.stats_lines = vec![format!("Failed to read stats: {e}")];  
+                        app.stats_lines = vec![format!("stats err: {e}")];
+                    }
+                }
+                let _ = tx.send(ControlMessage::ShowRule);
+            }
+
+
+            // ----- 50ms tick: drain worker responses -----
+            _ = resp_poll.tick() => {
+                while let Ok(resp) = resp_rx.try_recv() {
+                    match resp {
+                        WorkerResponse::RuleList(rules) => {
+                            app.rules_lines = if rules.is_empty() {
+                                vec!["(no active rules)".to_string()]
+                            } else {
+                                rules.iter().map(|(port, ip, tp, pkts)| {
+                                    format!(
+                                        "{} -> {}.{}.{}.{}:{}  ({} pkts)",
+                                        port, ip[0], ip[1], ip[2], ip[3], tp, pkts
+                                    )
+                                }).collect()
+                            };
+
+                            if echo_show_to_shell {
+                                echo_show_to_shell = false;
+                                if rules.is_empty() {
+                                    app.push_shell("  (no active rules)".to_string());
+                                } else {
+                                    app.push_shell(format!("  active rules ({}):", rules.len()));
+                                    for (port, ip, tp, pkts) in &rules {
+                                        app.push_shell(format!(
+                                            "    {} -> {}.{}.{}.{}:{}  ({} pkts)",
+                                            port, ip[0], ip[1], ip[2], ip[3], tp, pkts
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        WorkerResponse::Err(e) => {
+                            app.push_shell(format!("  worker err: {e}"));
+                        }
                     }
                 }
             }
         }
 
-        if app.should_quit {break;}
+        if app.should_quit { break; }
     }
     Ok(())
 }
 
 fn format_stats(if_index: u32, s: &InterfaceState) -> Vec<String> {
     vec![
-        format!("Interface idx: {}", if_index),
+        format!("iface idx : {}", if_index),
         format!("{:#?}", s),
     ]
 }
 
-pub fn ui(f: &mut ratatui::Frame, app: &App) {
+// ---------------------------------------------------------------
+// UI: three-panel layout
+//
+//   ┌ Network Status ─┐┌ Shell ─────────────────┐
+//   │                 ││ history                │
+//   ├ Active Rules ───┤│ ...                    │
+//   │                 ││ > <input>              │
+//   └─────────────────┘└────────────────────────┘
+//
+// The input is rendered as the LAST line of the Shell panel.
+// ---------------------------------------------------------------
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)]) // 메인 영역과 입력창
-        .split(f.area());
+pub fn ui(f: &mut Frame, app: &App) {
+    let area = f.area();
 
-    let main_chunks = Layout::default()
+    let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)]) // 통계와 로그
-        .split(chunks[0]);
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
 
-    // 1. Stats Panel
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(cols[0]);
+
+    // Network Status (top-left)
     let stats = Paragraph::new(app.stats_lines.join("\n"))
-        .block(Block::default().title(" Network Statu s").borders(Borders::ALL));
-    f.render_widget(stats, main_chunks[0]);
+        .block(Block::default().title(" Network Status ").borders(Borders::ALL));
+    f.render_widget(stats, left_rows[0]);
 
+    // Active Rules (bottom-left)
+    let rules = Paragraph::new(app.rules_lines.join("\n"))
+        .block(Block::default().title(" Active Rules ").borders(Borders::ALL));
+    f.render_widget(rules, left_rows[1]);
 
-    // show the tail of the logs so newest lines stay visible
-    let log_area_h = main_chunks[1].height.saturating_sub(2) as usize;
-    let start = app.logs.len().saturating_sub(log_area_h);
-    let log_text = app.logs[start..].join("\n");
-    let logs = Paragraph::new(log_text)
-        .block(Block::default().title(" Sessions & Logs ").borders(Borders::ALL));
-    f.render_widget(logs, main_chunks[1]);
- 
-    // 2. Log Panel
-    // let logs = Paragraph::new(app.logs.join("\n"))
-        // .block(Block::default().title(" Sessions & Logs ").borders(Borders::ALL));
-    // f.render_widget(logs, main_chunks[1]);
+    // Shell (right) — show tail of shell_lines + the live input as the last line
+    let shell_area = cols[1];
+    let inner_h = shell_area.height.saturating_sub(2) as usize; // minus the 2 border lines
+    let log_h   = inner_h.saturating_sub(1);                    // reserve 1 line for the prompt
 
-    // 3. CLI Input Panel
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().title(" Command CLI ").borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow)));
-    f.render_widget(input, chunks[1]);
+    let start = app.shell_lines.len().saturating_sub(log_h);
+    let mut text = app.shell_lines[start..].join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!("> {}", app.input));
+
+    let shell = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Shell ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+    f.render_widget(shell, shell_area);
 }
