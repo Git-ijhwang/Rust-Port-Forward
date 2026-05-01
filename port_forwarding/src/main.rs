@@ -6,8 +6,9 @@ use std::sync::mpsc;
 
 use anyhow::Context as _;
 use aya::{include_bytes_aligned, Ebpf};
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{Array, HashMap, MapData, PerCpuHashMap, PerCpuValues};
 use aya::programs::{Xdp, XdpFlags};
+use aya::util::nr_cpus;
 
 use clap::Parser;
 use dotenvy::dotenv;
@@ -56,7 +57,8 @@ pub enum ControlMessage {
 /// worker -> TUI
 pub enum WorkerResponse {
     /// Snapshot of all current rules. (listen_port, target_ip, target_port, packets)
-    RuleList(Vec<(u16, [u8; 4], u16, u64)>),
+    // RuleList(Vec<(u16, [u8; 4], u16, u64)>),
+    RuleList(Vec<(u16, ForwardRule)>),
     /// Worker-side error to display in the Shell.
     Err(String),
 }
@@ -134,13 +136,14 @@ fn recv_message( mut rules_map: HashMap<MapData, u16, ForwardRule>,
             }
 
             ControlMessage::ShowRule => {
-                let mut rules: Vec<(u16, [u8; 4], u16, u64)> = Vec::new();
+                let mut rules: Vec<(u16, ForwardRule)> = Vec::new();
+
                 for entry in rules_map.iter() {
                     if let Ok((port, rule)) = entry {
-                        rules.push((port, rule.target_ip, rule.target_port, rule.packets));
+                        rules.push((port, rule));
                     }
                 }
-                rules.sort_by_key(|(p, _, _, _)| *p);
+                rules.sort_by_key(|(p, _)| *p);
                 let _ = resp_tx.send(WorkerResponse::RuleList(rules));
             }
         }
@@ -186,19 +189,27 @@ async fn main() -> anyhow::Result<()> {
         .attach(&opt.iface, XdpFlags::SKB_MODE)
         .context("failed to attach XDP (SKB_MODE)")?;
 
-    {
-        let mut stats_map: HashMap<_, u32, InterfaceState> =
-            HashMap::try_from(ebpf.map_mut("IFACE_STATS").unwrap())?;
-        stats_map.insert(if_index, InterfaceState::default(), 0)?;
-        info!("Initialized IFACE_STATS for index {}", if_index);
-    }
-
+    // For Interface Statistics
     let stats_raw = ebpf
         .take_map("IFACE_STATS")
         .ok_or_else(|| anyhow::anyhow!("IFACE_STATS map missing"))?;
+    let mut stats_map: PerCpuHashMap<_, u32, InterfaceState> =
+        PerCpuHashMap::try_from(stats_raw)?;
 
-    let stats_map: HashMap<MapData, u32, InterfaceState> = HashMap::try_from(stats_raw)?;
+    let cpus = nr_cpus().map_err(|(_, e)| e)?;
+    let initial = PerCpuValues::try_from(vec![InterfaceState::default();cpus])?;
 
+    stats_map.insert(if_index, initial, 0)?;
+
+    info!("Initialized IFACE_STATS for index {}", if_index);
+
+    // let stats_raw = ebpf
+    //     .take_map("IFACE_STATS")
+    //     .ok_or_else(|| anyhow::anyhow!("IFACE_STATS map missing"))?;
+
+    // let stats_map: HashMap<MapData, u32, InterfaceState> = HashMap::try_from(stats_raw)?;
+
+    // For Rule 
     let rules_raw = ebpf
         .take_map("RULES")
         .ok_or_else(|| anyhow::anyhow!("RULES map missing"))?;

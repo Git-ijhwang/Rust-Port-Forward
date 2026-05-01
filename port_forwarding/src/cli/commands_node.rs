@@ -188,6 +188,7 @@ pub fn action_show_rule( args: Vec<String>,
     Ok("Rule shown.".into())
 }
 
+
 pub fn execute_command( root: &CommandNode,
                         input: &str,
                         tx: &mpsc::Sender<ControlMessage> )
@@ -225,7 +226,7 @@ pub fn execute_command( root: &CommandNode,
 
     match current.action {
         Some(action) => {
-           action(args, &tx);
+           action(args, &tx); //Execute Command
            return Ok("Command executed successfully.".into());
         },
         None => return Err("incomplete command".into()),

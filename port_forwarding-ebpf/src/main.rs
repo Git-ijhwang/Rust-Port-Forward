@@ -10,7 +10,7 @@ use network_types::{
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{xdp, map},
-    maps::{LruHashMap, Array, HashMap},
+    maps::{LruHashMap, Array, HashMap, PerCpuHashMap},
     programs::XdpContext
 };
 // use aya_log_ebpf::info;
@@ -36,7 +36,7 @@ pub static INVERSE_MAP: LruHashMap<SessionKey, SessionValue> =
 pub static RULES: HashMap<u16, ForwardRule> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-pub static IFACE_STATS: HashMap<u32, InterfaceState> = HashMap::with_max_entries(16, 0);
+pub static IFACE_STATS: PerCpuHashMap<u32, InterfaceState> = PerCpuHashMap::with_max_entries(16, 0);
 
 #[map]
 pub static CONFIG: Array<GlobalConfig> = Array::with_max_entries(1, 0);
@@ -114,9 +114,42 @@ fn header_update( ctx: &XdpContext,
     */
 
 
+#[inline(always)]
+fn update_stats (ifindex: u32, bytes: u64, is_tx: bool)
+{
+    unsafe {
+        if let Some(stats) = IFACE_STATS.get_ptr_mut(&ifindex) {
+            if is_tx {
+                (*stats).tx_bytes += bytes;
+                (*stats).tx_packets += 1;
+            } else {
+                (*stats).rx_bytes += bytes;
+                (*stats).rx_packets += 1;
+            }
+        }
+        /*
+        else {
+            let new_stats = if is_tx {
+                InterfaceState { tx_packets: 1, tx_bytes: bytes,
+                    ..Default::default()
+                }
+            }
+            else {
+                InterfaceState { rx_packets: 1, rx_bytes: bytes,
+                    ..Default::default()
+                }
+            };
+
+            let _ = IFACE_STATS.insert(&ifindex, &new_stats, 0);
+        }
+        */
+    }
+}
+
 fn try_restore_response( ctx: &XdpContext,
                          packet: &PacketContext,
-                         config: &GlobalConfig )
+                         config: &GlobalConfig,
+                        )
     -> Result<u32, ()>
 {
     let sess_key = SessionKey {
@@ -142,7 +175,7 @@ fn try_restore_response( ctx: &XdpContext,
         let old_sport = tcp_hdr.source;
         let old_dport = tcp_hdr.dest;
 
-        ip_hdr.src_addr = [192, 168, 4, 146]; // 원래 서버 IP로 복원
+        ip_hdr.src_addr = config.my_ip;
         ip_hdr.dst_addr = sess_val.orig_src_ip;
 
         tcp_hdr.source = 80u16.to_be_bytes(); // 원래 서버 포트로 복원
@@ -164,7 +197,7 @@ fn try_port_forwarding( ctx: XdpContext )
 {
 
     let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    let _len = (ctx.data_end() - ctx.data()) as u64;
+    let len = (ctx.data_end() - ctx.data()) as u64;
 
     let eth = unsafe {ptr_at::<EthHdr>(&ctx, 0)}?;
     // let mut eth_type = u16::from_be(((*(eth))).ether_type);
@@ -174,10 +207,14 @@ fn try_port_forwarding( ctx: XdpContext )
         return Ok(xdp_action::XDP_PASS);
     }
 
+    update_stats(ifindex, len, false);
     // info!(&ctx, "Received packet on ifindex {}", ifindex);
     let packet: verify::PacketContext = match unsafe { verify_headers(&ctx)} {
         Ok(p) => p,
-        Err(_) => return Ok(xdp_action::XDP_PASS),
+        Err(_) => {
+            // update_stats(ifindex, len, true);
+            return Ok(xdp_action::XDP_PASS);
+        }
     };
 
     let config = unsafe { CONFIG.get(0).ok_or(())? };
@@ -187,6 +224,7 @@ fn try_port_forwarding( ctx: XdpContext )
         // info!(&ctx, "Matched forwarding rule for port {}", packet.dport);
 
         if insert_inverse_mapping(&ctx, rule, &packet).is_err() {
+            // update_stats(ifindex, len, true);
             return Ok(xdp_action::XDP_PASS);
         }
 
@@ -209,20 +247,27 @@ fn try_port_forwarding( ctx: XdpContext )
             ip_hdr.dst_addr = new_dip;
             tcp_hdr.dest = new_port;
 
-            // 통계 업데이트
-            (*rule).packets += 1;
-            
             update_ip_checksum(ip_hdr, old_sip, new_sip, old_dip, new_dip);
             update_tcp_checksum(tcp_hdr, old_sip, new_sip, old_dip, new_dip, old_port, new_port);
 
             update_eth_header(eth_hdr, config)?;
         }
+
+        // 통계 업데이트
+        update_stats(ifindex, len, true);
+
         return Ok(xdp_action::XDP_TX);
     }
 
     match try_restore_response(&ctx, &packet, config) {
-        Ok(act) => Ok(act),
-        Err(_)  => Ok(xdp_action::XDP_PASS),
+        Ok(act) => {
+            update_stats(ifindex, len, true);
+            Ok(xdp_action::XDP_TX)
+        }
+
+        Err(_)  => {
+            Ok(xdp_action::XDP_PASS)
+        }
     }
 }
 

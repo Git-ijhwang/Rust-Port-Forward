@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 use std::sync::mpsc;
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{Array, HashMap, MapData, PerCpuHashMap};
 use futures::StreamExt;
 
 
@@ -214,13 +214,12 @@ pub fn ui(f: &mut Frame, tui: &TuiApp)
     }
     text.push_str(&format!("> {}", tui.input));
 
-    let shell = Paragraph::new(text)
-        .block(
-            Block::default()
-                .title(" Shell ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
+    let shell = Paragraph::new(text).block(
+        Block::default()
+            .title(" Shell ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
     f.render_widget(shell, shell_area);
 }
 
@@ -237,13 +236,13 @@ fn format_stats(if_index: u32, s: &InterfaceState) -> Vec<String> {
 // TUI main loop
 // ---------------------------------------------------------------
 pub async fn
-run_tuiapp<B: Backend> ( terminal: &mut Terminal<B>,
-                         mut tui: TuiApp,
-                         tx: mpsc::Sender<ControlMessage>,
-                         resp_rx: mpsc::Receiver<WorkerResponse>,
-                         mut stats_map: HashMap<MapData, u32, InterfaceState>,
-                         if_index: u32,
-                         command_tree: &CommandNode )
+run_tuiapp<B: Backend>( terminal: &mut Terminal<B>,
+                        mut tui: TuiApp,
+                        tx: mpsc::Sender<ControlMessage>,
+                        resp_rx: mpsc::Receiver<WorkerResponse>,
+                        stats_map: PerCpuHashMap<MapData, u32, InterfaceState>,  // ← 이거
+                        if_index: u32,
+                        command_tree: &CommandNode )
 -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -275,8 +274,12 @@ where
             // ----- 1s tick: stats poll + rules snapshot request -----
             _ = tick.tick() => {
                 match stats_map.get(&if_index, 0) {
-                    Ok(state) => {
-                        tui.stats_lines = format_stats(if_index, &state);
+                    Ok(per_cpu) => {
+                        let mut total = InterfaceState::default();
+                        for v in per_cpu.iter() {
+                            total.merge(v);
+                        }
+                        tui.stats_lines = format_stats(if_index, &total);
                     }
                     Err(e) => {
                         tui.stats_lines = vec![format!("stats err: {e}")];
@@ -294,11 +297,12 @@ where
                             tui.rules_lines = if rules.is_empty() {
                                 vec!["(no active rules)".to_string()]
                             } else {
-                                rules.iter().map(|(port, ip, tp, pkts)| {
-                                    format!(
-                                        "{} -> {}.{}.{}.{}:{}  ({} pkts)",
-                                        port, ip[0], ip[1], ip[2], ip[3], tp, pkts
-                                    )
+                                // rules.iter().map(|(port, ip, tp, pkts)| {
+                                rules.iter().map(|(port, pf)| {
+                                    let ip = pf.target_ip;
+                                    let tp = pf.target_port;
+                                    format!("{} -> {}.{}.{}.{}:{}",
+                                        port, ip[0], ip[1], ip[2], ip[3], tp)
                                 }).collect()
                             };
 
@@ -308,11 +312,13 @@ where
                                     tui.push_shell("  (no active rules)".to_string());
                                 } else {
                                     tui.push_shell(format!("  active rules ({}):", rules.len()));
-                                    for (port, ip, tp, pkts) in &rules {
-                                        tui.push_shell(format!(
-                                            "    {} -> {}.{}.{}.{}:{}  ({} pkts)",
-                                            port, ip[0], ip[1], ip[2], ip[3], tp, pkts
-                                        ));
+                                    for (port, pf) in &rules {
+                                            let ip = pf.target_ip;
+                                            let tp = pf.target_port;
+                                        tui.push_shell(
+                                            format!( "    {} -> {}.{}.{}.{}:{}",
+                                                port, ip[0], ip[1], ip[2], ip[3], tp)
+                                        );
                                     }
                                 }
                             }

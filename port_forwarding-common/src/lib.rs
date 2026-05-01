@@ -7,8 +7,8 @@ pub struct ForwardRule {
     pub target_ip: [u8; 4],
     pub target_port: u16,
     pub action: u32,      // 0: Pass, 1: Drop/Count
-    pub packets: u64,
-    pub bytes: u64,
+    // pub packets: u64,
+    // pub bytes: u64,
 }
 
 #[repr(C)]
@@ -16,6 +16,16 @@ pub struct ForwardRule {
 pub struct InterfaceState {
     pub rx_packets: u64,
     pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+}
+impl InterfaceState {
+    pub fn merge(&mut self, other: &InterfaceState) {
+        self.rx_packets += other.rx_packets;
+        self.rx_bytes   += other.rx_bytes;
+        self.tx_packets += other.tx_packets;
+        self.tx_bytes   += other.tx_bytes;
+    }
 }
 
 // 유저 스페이스(aya)에서만 사용되는 트레이트 구현
